@@ -761,7 +761,7 @@ cmd_add() {
       # apptree like discord: launcher binary matching app name somewhere in tree
       # dash/underscore-insensitive both ways (stem discordcanary = file discord-canary)
       local fuzzy; fuzzy=$(printf '%s' "$stem" | sed 's/./&[ _-]?/g')
-      binpath=$(grep -v '/$' "$listing" | grep -viP '/(man|doc|include|tests?|examples?|locale|assets|static|completions)/' | grep -iP "^$top/(.*/)?[^/]*$fuzzy[^/]*$" | grep -viP '\.(png|svg|xpm|ico|gif|jpe?g|webp|bmp|tiff|mp4|webm|mkv|ogg|mp3|wav|flac|opus|ttf|otf|woff2?|txt|md|html|desktop|xml|json|c|h|o|a|m4|am|in|ac|la|pc|[1-9]|so(\..*)?)$' | awk -F/ '{print NF-1, $0}' | sort -n | cut -d' ' -f2- | head -1 || true)
+      binpath=$(grep -v '/$' "$listing" | grep -viP '/(man|doc|include|tests?|examples?|locale|assets|static|completions)/' | grep -iP "^$top/(.*/)?[^/]*$fuzzy[^/]*$" | grep -viP '\.(png|svg|xpm|ico|gif|jpe?g|webp|bmp|tiff|mp4|webm|mkv|ogg|mp3|wav|flac|opus|ttf|otf|woff2?|txt|md|html|desktop|xml|json|c|h|o|a|m4|am|in|ac|la|pc|[1-9]|so(\..*)?|service|service\.in|conf|policy|rule|rules|metainfo|appdata|po|mo|db|ini|cfg|yaml|yml|lock|repos?)$' | awk -F/ '{print NF-1, $0}' | sort -n | cut -d' ' -f2- | head -1 || true)
       if [ -n "$binpath" ]; then
         kind="opttree"
         local _ldir="${binpath%/*}"
@@ -1011,7 +1011,16 @@ package() {
   cd "$top"
   install -dm755 "\$pkgdir/opt/$name" "\$pkgdir/usr/bin"
   cp -a * "\$pkgdir/opt/$name/"
-  ln -s "/opt/$name/$binpath" "\$pkgdir/usr/bin/$binname"
+  # safety net: never symlink a non-executable (e.g. a D-Bus .service or .desktop
+  # file) as the CLI launcher. Fall back to a real binary matching the app name.
+  _launch="\$binpath"
+  if [ ! -f "\$_launch" ] || [ ! -x "\$_launch" ]; then
+    _cand=\$(find . -maxdepth 3 -type f -executable \
+             \\( -name "$binname" -o -name "$binname.bin" -o -name "$stem" \\) 2>/dev/null | head -1)
+    [ -z "\$_cand" ] && _cand=\$(find . -maxdepth 3 -type f -executable 2>/dev/null | head -1)
+    [ -n "\$_cand" ] && _launch="\${_cand#./}"
+  fi
+  ln -s "/opt/$name/\$_launch" "\$pkgdir/usr/bin/$binname"
 $desk_install
 $iconinst
 }
