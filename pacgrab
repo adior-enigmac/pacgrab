@@ -11,6 +11,8 @@ BASE="${AUR_LOCAL:-$HOME/pacgrab}"
 # fail with "database already registered" (verified against pacman/libalpm).
 REPO_NAME="pacgrab"
 DB="$BASE/$REPO_NAME.db.tar.gz"
+# raw mirror install.sh pulls from - timer-run also self-updates from here
+PG_RAW="${PACGRAB_RAW:-https://raw.githubusercontent.com/adior-enigmac/pacgrab/main}"
 
 die() { echo "error: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null || die "missing $1"; }
@@ -1738,12 +1740,33 @@ cmd_update_all() { # bump+rebuild every _github package that is outdated
   echo "update run: $n checked, ${#failed[@]} failed${failed:+ (${failed[*]})}"
 }
 
+cmd_self_update() { # fetch latest pacgrab + TUI into $BASE (best-effort: never fails the run)
+  local f tmp
+  for f in pacgrab pacgrab-tui.sh; do
+    # temp + rename: the running script holds its old inode open, so curl-ing
+    # straight over $BASE/pacgrab would corrupt the live run
+    tmp=$(mktemp "$BASE/.selfupdate-XXXXXX") || continue
+    if curl -fsSL --max-time 60 "$PG_RAW/$f" -o "$tmp" && [ -s "$tmp" ]; then
+      if cmp -s "$tmp" "$BASE/$f" 2>/dev/null; then
+        rm -f "$tmp" # already current - stay quiet in the log
+      else
+        chmod 755 "$tmp" && mv "$tmp" "$BASE/$f" && echo "self-update: $f updated" \
+          || { rm -f "$tmp"; echo "self-update: could not install $f" >&2; }
+      fi
+    else
+      rm -f "$tmp"
+      echo "self-update: $f fetch failed (kept current copy)" >&2
+    fi
+  done
+  return 0 # best-effort: recipe updates must still run when offline
+}
+
 cmd_timer_install() { # install systemd user timer for weekly autoupdates
   local unitdir="$HOME/.config/systemd/user"
   mkdir -p "$unitdir" "$HOME/.local/share/pacgrab"
   cat > "$unitdir/pacgrab-update.service" <<EOF
 [Unit]
-Description=pacgrab autoupdate (GitHub releases -> rebuild local packages)
+Description=pacgrab autoupdate (update pacgrab itself, rebuild outdated local packages)
 
 [Service]
 Type=oneshot
@@ -1865,7 +1888,7 @@ case "${1:-help}" in
   migrate) cmd_migrate ;;
   fix-conflicts) cmd_fix_conflicts ;;
   prune) shift; cmd_prune "$@" ;;
-  timer-run) cmd_update_all ;; # internal: what pacgrab-update.service executes
+  timer-run) cmd_self_update; cmd_update_all ;; # internal: what pacgrab-update.service executes
   check) cmd_check ;;
   edit) shift; cmd_edit "$@" ;;
   new) shift; cmd_new "$@" ;;

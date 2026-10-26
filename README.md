@@ -110,8 +110,9 @@ pacgrab https://github.com/owner/repo/releases/download/v1.2.3/app-linux-x86_64.
 ### Autoupdates
 
 GitHub-backed recipes self-update: `install.sh` enables a weekly systemd user
-timer that checks GitHub, rebuilds what's outdated, and installs it via
-`pacman -U`. Logs land in `~/.local/share/pacgrab/update.log`. To opt out:
+timer that checks GitHub, rebuilds what's outdated, installs it via
+`pacman -U`, and updates the pacgrab scripts themselves to the latest version
+from this repo. Logs land in `~/.local/share/pacgrab/update.log`. To opt out:
 
 ```sh
 systemctl --user disable --now pacgrab-update.timer

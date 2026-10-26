@@ -8,7 +8,8 @@
 #   2. symlinks them into ~/.local/bin so they are on PATH
 #   3. runs `pacgrab setup`: seeds the local repo db and appends the [pacgrab]
 #      section to /etc/pacman.conf (idempotent; asks for sudo once)
-#   4. enables the weekly autoupdate timer (best-effort; opt out with
+#   4. enables the weekly autoupdate timer: rebuilds outdated recipes and
+#      updates pacgrab itself (best-effort; opt out with
 #      `systemctl --user disable --now pacgrab-update.timer`)
 #
 # Env overrides:
