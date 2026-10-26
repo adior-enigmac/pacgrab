@@ -409,7 +409,7 @@ cmd_check() { # check for updates without bumping
   # each recipe talks to a different server - run the lookups together rather
   # than one curl after another, then print in directory order
   local d outdir i=0 f
-  outdir=$(mktemp -d /tmp/opencode/pacgrab-check-XXXXXX) || return 1
+  outdir=$(mktemp -d "${TMPDIR:-/tmp}/pacgrab-check-XXXXXX") || return 1
   for d in "$BASE"/*/; do
     [ -f "$d/PKGBUILD" ] || continue
     ( check_one "$d" >"$outdir/$i" ) &
@@ -490,7 +490,7 @@ cmd_clean() {
     [ -d "$d" ] || continue
     rm -rf "$d/src" "$d/pkg"
   done
-  rm -rf /tmp/opencode/pacgrab-add* /tmp/opencode/aur-migrate
+  rm -rf "${TMPDIR:-/tmp}"/pacgrab-add* "${TMPDIR:-/tmp}"/aur-migrate
   rm -f "${SRCDEST:-${XDG_CACHE_HOME:-$HOME/.cache}/makepkg/src}"/*.part
   echo "cleaned pacgrab dirs + /tmp. Cache kept at $PKGDEST_DIR ($(du -sh "$PKGDEST_DIR" 2>/dev/null | cut -f1))."
 }
@@ -554,7 +554,8 @@ cmd_setup() {
   else
     echo "repo db already present in $BASE"
   fi
-  local conf="/etc/pacman.conf"
+  # conf path overridable for testing / containers (default: system pacman.conf)
+  local conf="${PACGRAB_PACMAN_CONF:-/etc/pacman.conf}"
   if [ ! -f "$conf" ]; then
     echo "note: $conf not found - add this section manually:"
     print_pacman_section
@@ -567,12 +568,20 @@ cmd_setup() {
       echo "WARNING: $conf has a [local] section - libalpm reserves that name,"
       echo "         so 'pacman -Sy' fails for every repo. Remove it."
     fi
-    echo "appending [$REPO_NAME] to $conf (sudo)..."
-    # `sudo tee -a`, not `sudo >>`: the redirect must run as root, and tee
-    # reads the block from this pipe. Leading \n guards a missing final newline.
-    printf '\n[%s]\nSigLevel = Optional TrustAll\nServer = file://%s\n' \
-      "$REPO_NAME" "$BASE" | sudo tee -a "$conf" >/dev/null \
-      || die "could not write $conf"
+    echo "appending [$REPO_NAME] to $conf..."
+    if [ -w "$conf" ]; then
+      # already writable (root, or a sandboxed/test conf): append directly
+      printf '\n[%s]\nSigLevel = Optional TrustAll\nServer = file://%s\n' \
+        "$REPO_NAME" "$BASE" >>"$conf" || die "could not write $conf"
+    else
+      # needs root: `sudo tee -a`, not `sudo >>` - the redirect must run as
+      # root and tee reads the block from this pipe. sudo takes its password
+      # from the tty, not this pipe, so the piped installer cannot feed it.
+      # Leading \n guards a missing final newline in the target.
+      printf '\n[%s]\nSigLevel = Optional TrustAll\nServer = file://%s\n' \
+        "$REPO_NAME" "$BASE" | sudo tee -a "$conf" >/dev/null \
+        || die "could not write $conf (need sudo)"
+    fi
     echo "added [$REPO_NAME] to $conf"
   fi
   echo "next: sudo pacman -Sy   (then: pacgrab <url> to install an app)"
@@ -631,7 +640,7 @@ cmd_add() {
   # (asset/ver may be refined after download for generic URLs; see below)
   local srcdest="${SRCDEST:-${XDG_CACHE_HOME:-$HOME/.cache}/makepkg/src}"
   mkdir -p "$srcdest"
-  local tmp; tmp=$(mktemp -d /tmp/opencode/pacgrab-add-XXXXXX)
+  local tmp; tmp=$(mktemp -d "${TMPDIR:-/tmp}/pacgrab-add-XXXXXX")
   if [ -z "$gh" ]; then
     # cheap redirect resolution so query-string URLs get their real filename
     local eff
@@ -1218,7 +1227,7 @@ cmd_S_one() { # $1=pkgname  $2=nobuild(0/1)
   # 1 if this recipe dir isn't there yet, so a failed grab can undo itself
   local made_dir=1; [ -e "$BASE/$name" ] && made_dir=0
 
-  tmp=$(mktemp -d /tmp/opencode/pacgrab-S-XXXXXX)
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/pacgrab-S-XXXXXX")
   if ! curl -fsSL "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=$base" -o "$tmp/PKGBUILD"; then
     rm -rf "$tmp"; echo "$pkg: cannot fetch the AUR PKGBUILD for $base"; return 1
   fi
@@ -1485,7 +1494,7 @@ cmd_sync() { # $@=names (default: all): install recipe desktops+icons directly, 
         url=$(grep -oP '"icon\.(png|svg)::\K[^"]+' "$d/PKGBUILD" | head -1 || true)
         if [ -n "$url" ]; then
           ext="${url%%\?*}"; ext="${ext##*.}"
-          src="/tmp/opencode/pacgrab-icon-$icon.$ext"
+          src="${TMPDIR:-/tmp}/pacgrab-icon-$icon.$ext"
           echo "fetching icon for $icon..."
           if curl -fsSL -o "$src" "$url"; then
             if [[ "$src" == *.svg ]]; then
