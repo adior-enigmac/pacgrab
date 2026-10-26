@@ -1844,8 +1844,6 @@ cmd_help() {
     "clean|delete build leftovers and partial downloads"
     "repo|regenerate the local pacman repo database"
     "setup|one-time: create repo db + add [pacgrab] to /etc/pacman.conf"
-    "timer-install|weekly autoupdates (install.sh enables this automatically)"
-    "timer-remove|remove the autoupdate timer"
   )
   local w=0 c t
   for c in "${cmds[@]}"; do t=${c%%|*}; [ "${#t}" -gt "$w" ] && w=${#t}; done
@@ -1874,7 +1872,6 @@ case "${1:-help}" in
   clean) cmd_clean ;;
   repo) cmd_repo ;;
   setup) cmd_setup ;;
-  timer-install) cmd_timer_install ;;
-  timer-remove) cmd_timer_remove ;;
+  timer-setup) cmd_timer_install ;; # internal: what install.sh runs
   *) cmd_help; exit 1;;
 esac

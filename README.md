@@ -99,8 +99,6 @@ pacgrab prune [--yes]     delete recipes for apps that are not installed
 pacgrab clean             delete build leftovers and partial downloads
 pacgrab repo              regenerate the local pacman repo database
 pacgrab setup             one-time: create repo db + add [pacgrab] to /etc/pacman.conf
-pacgrab timer-install     weekly autoupdates via a systemd timer
-pacgrab timer-remove      remove the autoupdate timer
 ```
 
 Run `pacgrab help` for the same list. A bare URL short-circuits to install:
@@ -113,11 +111,10 @@ pacgrab https://github.com/owner/repo/releases/download/v1.2.3/app-linux-x86_64.
 
 GitHub-backed recipes self-update: `install.sh` enables a weekly systemd user
 timer that checks GitHub, rebuilds what's outdated, and installs it via
-`pacman -U`. Manage it with:
+`pacman -U`. Logs land in `~/.local/share/pacgrab/update.log`. To opt out:
 
 ```sh
-pacgrab timer-install   # re-enable (also run automatically by install.sh)
-pacgrab timer-remove    # opt out; logs: ~/.local/share/pacgrab/update.log
+systemctl --user disable --now pacgrab-update.timer
 ```
 
 ### The TUI
