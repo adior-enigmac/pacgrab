@@ -47,19 +47,38 @@ Server = file:///home/YOU/pacgrab
 
 ## Install
 
+One line, no git needed:
+
 ```sh
-git clone git@github.com:adior-enigmac/pacgrab.git
-cd pacgrab
-install -Dm755 pacgrab          ~/.local/bin/pacgrab
-install -Dm755 pacgrab-tui.sh   ~/.local/bin/pacgrab-tui.sh
+curl -fsSL https://raw.githubusercontent.com/adior-enigmac/pacgrab/main/install.sh | bash
 ```
 
-Enable the local repo once (as root), then sync:
+This downloads `pacgrab` and `pacgrab-tui.sh` into `~/pacgrab`, symlinks them
+into `~/.local/bin`, then runs **`pacgrab setup`**, which:
+
+- creates the local package pool + an empty `pacgrab.db`, and
+- appends the `[pacgrab]` section to `/etc/pacman.conf` (asks for `sudo` once).
+
+Both steps are **idempotent** — re-running `pacgrab setup` is safe and won't
+duplicate the config block. When it finishes, sync so pacman picks the repo up:
 
 ```sh
-pacgrab repo   # prints the exact [pacgrab] block to paste into /etc/pacman.conf
 sudo pacman -Sy
 ```
+
+### Manual install
+
+Prefer to do it by hand? Copy the scripts wherever you like, then run setup:
+
+```sh
+install -Dm755 pacgrab        ~/.local/bin/pacgrab
+install -Dm755 pacgrab-tui.sh ~/.local/bin/pacgrab-tui.sh
+pacgrab setup                 # seeds the db + writes /etc/pacman.conf
+sudo pacman -Sy
+```
+
+If you'd rather edit `/etc/pacman.conf` yourself, `pacgrab repo` prints the
+exact block to paste.
 
 ## Usage
 
@@ -83,6 +102,7 @@ pacgrab fix-conflicts     delete unowned files that would block pacgrab package 
 pacgrab prune [--yes]     delete recipes for apps that are not installed
 pacgrab clean             delete build leftovers and partial downloads
 pacgrab repo              regenerate the local pacman repo database
+pacgrab setup             one-time: create repo db + add [pacgrab] to /etc/pacman.conf
 pacgrab timer-install     weekly autoupdates via a systemd timer
 pacgrab timer-remove      remove the autoupdate timer
 ```

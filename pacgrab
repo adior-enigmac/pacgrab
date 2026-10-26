@@ -530,6 +530,55 @@ cmd_repo() {
   return 0
 }
 
+# One-time setup: create the base dir + an empty repo db, and add the
+# [pacgrab] section to /etc/pacman.conf (with sudo). Idempotent - safe to run
+# again; existing pieces are left alone. This is what `install.sh` calls so a
+# fresh install needs no hand-editing of pacman.conf.
+print_pacman_section() {
+  echo "  [$REPO_NAME]"
+  echo "  SigLevel = Optional TrustAll"
+  echo "  Server = file://$BASE"
+}
+
+cmd_setup() {
+  mkdir -p "$BASE"
+  # empty-but-present db: once the [pacgrab] section exists, a missing
+  # $REPO_NAME.db makes `pacman -Sy` fail for every repo, so seed an empty one
+  # first (same approach as cmd_clean's no-packages path).
+  if [ ! -f "$BASE/$REPO_NAME.db.tar.gz" ]; then
+    tar czf "$BASE/$REPO_NAME.db.tar.gz" --files-from /dev/null
+    tar czf "$BASE/$REPO_NAME.files.tar.gz" --files-from /dev/null
+    ln -sf "$REPO_NAME.db.tar.gz" "$BASE/$REPO_NAME.db"
+    ln -sf "$REPO_NAME.files.tar.gz" "$BASE/$REPO_NAME.files"
+    echo "seeded empty repo db in $BASE"
+  else
+    echo "repo db already present in $BASE"
+  fi
+  local conf="/etc/pacman.conf"
+  if [ ! -f "$conf" ]; then
+    echo "note: $conf not found - add this section manually:"
+    print_pacman_section
+    return 0
+  fi
+  if grep -q "^\[$REPO_NAME\]" "$conf" 2>/dev/null; then
+    echo "[$REPO_NAME] already present in $conf"
+  else
+    if grep -q '^\[local\]' "$conf" 2>/dev/null; then
+      echo "WARNING: $conf has a [local] section - libalpm reserves that name,"
+      echo "         so 'pacman -Sy' fails for every repo. Remove it."
+    fi
+    echo "appending [$REPO_NAME] to $conf (sudo)..."
+    # `sudo tee -a`, not `sudo >>`: the redirect must run as root, and tee
+    # reads the block from this pipe. Leading \n guards a missing final newline.
+    printf '\n[%s]\nSigLevel = Optional TrustAll\nServer = file://%s\n' \
+      "$REPO_NAME" "$BASE" | sudo tee -a "$conf" >/dev/null \
+      || die "could not write $conf"
+    echo "added [$REPO_NAME] to $conf"
+  fi
+  echo "next: sudo pacman -Sy   (then: pacgrab <url> to install an app)"
+  return 0
+}
+
 # Paste a release URL (GitHub or any direct download) -> installs the app.
 # GitHub URLs also register for autoupdates. Generic URLs install fine but bump manually.
 # usage: install <url> [pkgname] [--no-build]
@@ -1661,6 +1710,7 @@ cmd_help() {
     "new <name> O/R|scaffold a recipe by hand from GitHub owner/repo"
     "clean|delete build leftovers and partial downloads"
     "repo|regenerate the local pacman repo database"
+    "setup|one-time: create repo db + add [pacgrab] to /etc/pacman.conf"
     "timer-install|weekly autoupdates via a systemd timer"
     "timer-remove|remove the autoupdate timer"
   )
@@ -1693,6 +1743,7 @@ case "${1:-help}" in
   new) shift; cmd_new "$@" ;;
   clean) cmd_clean ;;
   repo) cmd_repo ;;
+  setup) cmd_setup ;;
   timer-install) cmd_timer_install ;;
   timer-remove) cmd_timer_remove ;;
   *) cmd_help; exit 1;;
