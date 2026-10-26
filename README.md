@@ -37,7 +37,7 @@ Everything lives in a base directory (default `~/pacgrab`, override with
 
 `pacgrab repo` indexes the pool into a local database (`pacgrab.db`) that you add
 to `/etc/pacman.conf`. From then on the apps are ordinary packages: `pacman -Syu`
-upgrades them, `pacgrab uninstall` removes them.
+upgrades them, `pacman -R` (or your AUR helper) removes them.
 
 ```
 [pacgrab]
@@ -87,11 +87,6 @@ pacgrab -S <pkg> [...]    AUR replacement: grab the project's own download (else
 pacgrab <url>             install app from a link (GitHub release or direct download)
 pacgrab list              show managed packages and install status
 pacgrab recipe [p ...]    look inside recipes: one line each, or print full PKGBUILD(s)
-pacgrab build <p> [...]   rebuild + reinstall one or more packages
-pacgrab build-all         rebuild + reinstall everything
-pacgrab uninstall <name>  remove the app (recipe stays; add --purge to delete it too)
-pacgrab update <name>     bump + rebuild one GitHub package
-pacgrab update-all        bump + rebuild all outdated GitHub packages
 pacgrab check             show which GitHub packages have updates
 pacgrab sync [name ...]   install recipe desktops+icons directly, no rebuild
 pacgrab refresh <name>    regenerate recipe from its URL with current code
@@ -116,11 +111,13 @@ pacgrab https://github.com/owner/repo/releases/download/v1.2.3/app-linux-x86_64.
 
 ### Autoupdates
 
-GitHub-backed recipes self-update. Either run `pacgrab update-all` yourself, or
-install a weekly systemd user timer:
+GitHub-backed recipes self-update: `install.sh` enables a weekly systemd user
+timer that checks GitHub, rebuilds what's outdated, and installs it via
+`pacman -U`. Manage it with:
 
 ```sh
-pacgrab timer-install   # logs to ~/.local/share/pacgrab/update.log
+pacgrab timer-install   # re-enable (also run automatically by install.sh)
+pacgrab timer-remove    # opt out; logs: ~/.local/share/pacgrab/update.log
 ```
 
 ### The TUI

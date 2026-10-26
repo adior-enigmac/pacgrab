@@ -8,6 +8,8 @@
 #   2. symlinks them into ~/.local/bin so they are on PATH
 #   3. runs `pacgrab setup`: seeds the local repo db and appends the [pacgrab]
 #      section to /etc/pacman.conf (idempotent; asks for sudo once)
+#   4. enables the weekly autoupdate timer (best-effort; `pacgrab timer-remove`
+#      opts out)
 #
 # Env overrides:
 #   PREFIX     where to symlink the scripts  (default: ~/.local/bin)
@@ -41,6 +43,10 @@ echo "symlinked into $PREFIX"
 
 # seed the repo db + wire up /etc/pacman.conf
 "$BASE/pacgrab" setup
+
+# weekly autoupdates: enable the user timer (best-effort - needs a user systemd
+# session, which a normal login shell has; failure only means no auto-updates)
+"$BASE/pacgrab" timer-install || echo "note: update timer not enabled - run 'pacgrab timer-install' later"
 
 echo
 echo "done. next steps:"

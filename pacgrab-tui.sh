@@ -72,36 +72,12 @@ cmd_aur() {
   "$PACGRAB" -S "$pkg"
 }
 
-cmd_build_one() {
-  mapfile -t bases < <(recipe_names)
-  [ ${#bases[@]} -gt 0 ] || { gum style --foreground 1 "no PKGBUILDs in $BASE"; return; }
-  pick=$(printf '%s\n' "${bases[@]}" | gum choose --header "Pick package to build") || return
-  gum style --border normal --padding "0 1" "Building $pick from $BASE/$pick"
-  if "$PACGRAB" build "$pick" 2>&1 | tee "/tmp/pacgrab-$pick.log"; then
-    gum style --foreground 2 "OK: $pick installed"
-  else
-    gum style --foreground 1 "FAILED: $pick — log /tmp/pacgrab-$pick.log"
-    gum pager < "/tmp/pacgrab-$pick.log"
-  fi
-}
-
-cmd_build_all() {
-  gum confirm "Build ALL ($(find "$BASE" -maxdepth 2 -name PKGBUILD | wc -l) bases)? Takes a while." || return
-  for d in "$BASE"/*/; do
-    [ -f "$d/PKGBUILD" ] || continue
-    base=$(basename "$d")
-    gum style --foreground 4 "=== $base ==="
-    "$PACGRAB" build "$base" 2>&1 | tail -n 5 || gum style --foreground 1 "FAILED: $base"
-  done
-  gum style --foreground 2 "build-all done"
-}
-
 cmd_menu() {
   command -v gum >/dev/null || { echo "gum missing, falling back to status"; cmd_status; return; }
   while true; do
     gum style --foreground 5 --bold "pacgrab :: $(find "$BASE" -maxdepth 2 -name PKGBUILD | wc -l) pkgs · repo: $(repo_state) · [$REPO_NAME]: $(conf_state)"
     choice=$(gum choose --header "What to do?" \
-      "Status" "Recipes" "AUR install (-S)" "Install from URL" "Build one" "Build all" "Update all" "Uninstall" "Check GH updates" \
+      "Status" "Recipes" "AUR install (-S)" "Install from URL" "Check GH updates" \
       "Repo setup" "Clean artifacts" "View last log" "Quit") || break
     case "$choice" in
       Status) gum pager <<< "$(cmd_status)" ;;
@@ -110,12 +86,6 @@ cmd_menu() {
       "Install from URL")
         url=$(gum input --placeholder "Paste GitHub release URL...") || continue
         [ -n "$url" ] && "$PACGRAB" install "$url" 2>&1 | gum pager ;;
-      "Build one") cmd_build_one ;;
-      "Build all") cmd_build_all ;;
-      "Update all") "$PACGRAB" update-all 2>&1 | gum pager ;;
-      "Uninstall")
-        pick=$(pacman -Qq 2>/dev/null | gum filter --header "Pick installed package to remove") || continue
-        [ -n "$pick" ] && "$PACGRAB" uninstall "$pick" 2>&1 | gum pager ;;
       "Check GH updates") "$PACGRAB" check 2>&1 | gum pager ;;
       "Repo setup") "$PACGRAB" repo 2>&1 | gum pager ;;
       "Clean artifacts") "$PACGRAB" clean; gum style --foreground 2 "cleaned" ;;

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # pacgrab - Gear Lever-like manager for local PKGBUILDs
 # Base: ~/pacgrab/<pkgname>/PKGBUILD
-# Usage: pacgrab <list|add|build|update|check|clean|repo|timer-install|...> [args]
+# Usage: pacgrab <list|add|-S|check|clean|repo|setup|...> [args]
 set -euo pipefail
 
 BASE="${AUR_LOCAL:-$HOME/pacgrab}"
@@ -774,7 +774,7 @@ cmd_add() {
   local d="$BASE/$name"
   if [ -e "$d" ]; then
     if pacman -Q "$name" >/dev/null 2>&1; then
-      die "$d exists and $name is installed (pacgrab build $name to reinstall)"
+      die "$d exists and $name is installed (reinstall with: sudo pacman -S $name)"
     else
       echo "$d exists but $name is not installed - building..."
       cmd_build "$name"
@@ -1295,7 +1295,7 @@ cmd_S_one() { # $1=pkgname  $2=nobuild(0/1)
       fi
       return 0
     fi
-    echo "$pkg: provided by the pacgrab [$REPO_NAME] repo (build it with: pacgrab build $pkg)"
+    echo "$pkg: provided by the pacgrab [$REPO_NAME] repo (install with: sudo pacman -S $pkg)"
     return 0
   fi
 
@@ -1379,7 +1379,6 @@ cmd_S_one() { # $1=pkgname  $2=nobuild(0/1)
 # `pacman -Qm` (foreign = installed but not in any sync repo = the AUR ones)
 # and runs each through the same grabber as `-S`, in adopt mode: nothing is
 # rebuilt (they are already installed) and the AUR-helper fallback is skipped.
-# Run `pacgrab build-all` afterwards if you want them rebuilt as pacgrab pkgs.
 cmd_migrate() {
   need curl; need jq
   local pkg ver row made=0 already=0 aur=0
@@ -1415,7 +1414,7 @@ cmd_migrate() {
   echo
   echo "migrate: $made new recipe(s), $already already pacgrab, $aur left on the AUR"
   if [ "$made" -gt 0 ]; then
-    echo "run 'pacgrab list' to see them, 'pacgrab build-all' to rebuild as pacgrab pkgs"
+    echo "run 'pacgrab list' to see them"
   fi
   return 0
 }
@@ -1558,7 +1557,7 @@ cmd_sync() { # $@=names (default: all): install recipe desktops+icons directly, 
       if [ -n "$have" ] && [ "$have" = "$want" ]; then
         echo "$name already in sync ($have)"
       else
-        echo "$name: shipped desktop needs a build (run pacgrab build $name) [have: ${have:-none}, recipe: $want]"
+        echo "$name: shipped desktop needs a build [have: ${have:-none}, recipe: $want]"
         fail=1
       fi
       continue
@@ -1583,7 +1582,7 @@ cmd_sync() { # $@=names (default: all): install recipe desktops+icons directly, 
       if [ -n "$have" ] && [ "$have" = "$want" ]; then
         echo "$name already in sync ($have, desktop provided by package)"
       else
-        echo "$name: desktop ships with the package, needs a build (run pacgrab build $name) [have: ${have:-none}, recipe: $want]"
+        echo "$name: desktop ships with the package, needs a build [have: ${have:-none}, recipe: $want]"
         fail=1
       fi
       continue
@@ -1617,7 +1616,7 @@ cmd_sync() { # $@=names (default: all): install recipe desktops+icons directly, 
         # not once per recipe on every run)
         shipped=$(recipe_ships "$d") || shipped=""
         if printf '%s\n' "$shipped" | grep -qE "/(icons/hicolor/[^/]+/apps|pixmaps)/$icon\.(svg|png)$"; then
-          echo "$name: icon provided by package (run pacgrab build $name)"
+          echo "$name: icon provided by package (needs a build)"
           continue
         fi
         url=$(grep -oP '"icon\.(png|svg)::\K[^"]+' "$d/PKGBUILD" | head -1 || true)
@@ -1636,7 +1635,7 @@ cmd_sync() { # $@=names (default: all): install recipe desktops+icons directly, 
             echo "$name: WARNING icon download failed"; fail=1
           fi
         else
-          echo "$name: WARNING no icon file for '$icon' and none bundled (run pacgrab build $name)"
+          echo "$name: WARNING no icon file for '$icon' and none bundled"
         fi
     fi
   done
@@ -1736,7 +1735,7 @@ cmd_update_all() { # bump+rebuild every _github package that is outdated
     fi
   done
   cmd_repo >/dev/null 2>&1 || true
-  echo "update-all done: $n checked, ${#failed[@]} failed${failed:+ (${failed[*]})}"
+  echo "update run: $n checked, ${#failed[@]} failed${failed:+ (${failed[*]})}"
 }
 
 cmd_timer_install() { # install systemd user timer for weekly autoupdates
@@ -1748,7 +1747,7 @@ Description=pacgrab autoupdate (GitHub releases -> rebuild local packages)
 
 [Service]
 Type=oneshot
-ExecStart=$BASE/pacgrab update-all
+ExecStart=$BASE/pacgrab timer-run
 StandardOutput=append:%h/.local/share/pacgrab/update.log
 StandardError=append:%h/.local/share/pacgrab/update.log
 EOF
@@ -1833,16 +1832,11 @@ cmd_help() {
     "<url>|install app from a link (GitHub release or direct download)"
     "list|show managed packages and install status"
     "recipe [p ...]|look inside recipes: one line each, or print full PKGBUILD(s)"
-    "build <p> [...]|rebuild + reinstall one or more packages"
-    "build-all|rebuild + reinstall everything"
-    "uninstall <name>|remove the app (recipe stays; add --purge to delete it too)"
-    "update <name>|bump + rebuild one GitHub package"
     "sync [name ...]|install recipe desktops+icons directly, no rebuild"
     "refresh <name>|regenerate recipe from its URL with current code"
     "migrate|make pacgrab recipes from every installed AUR package"
     "fix-conflicts|delete unowned files that would block pacgrab package installs"
     "prune [--yes]|delete recipes for apps that are not installed"
-    "update-all|bump + rebuild all outdated GitHub packages"
     "check|show which GitHub packages have updates"
     "bump <p> [ver]|bump version: GitHub API or explicit version"
     "edit <name>|open the PKGBUILD in $EDITOR"
@@ -1850,7 +1844,7 @@ cmd_help() {
     "clean|delete build leftovers and partial downloads"
     "repo|regenerate the local pacman repo database"
     "setup|one-time: create repo db + add [pacgrab] to /etc/pacman.conf"
-    "timer-install|weekly autoupdates via a systemd timer"
+    "timer-install|weekly autoupdates (install.sh enables this automatically)"
     "timer-remove|remove the autoupdate timer"
   )
   local w=0 c t
@@ -1867,17 +1861,13 @@ case "${1:-help}" in
   install|add) shift; cmd_add "$@" ;;
   -S) shift; cmd_S "$@" ;;
   http*://*) cmd_add "$@" ;; # bare URL -> install
-  build) shift; cmd_build "$@" ;;
-  uninstall) shift; cmd_uninstall "$@" ;;
-  build-all) cmd_build_all ;;
   bump) shift; cmd_bump "$@" ;;
-  update) shift; cmd_update "$@" ;;
   sync) shift; cmd_sync "$@" ;;
   refresh) shift; cmd_refresh "$@" ;;
   migrate) cmd_migrate ;;
   fix-conflicts) cmd_fix_conflicts ;;
   prune) shift; cmd_prune "$@" ;;
-  update-all) cmd_update_all ;;
+  timer-run) cmd_update_all ;; # internal: what pacgrab-update.service executes
   check) cmd_check ;;
   edit) shift; cmd_edit "$@" ;;
   new) shift; cmd_new "$@" ;;
