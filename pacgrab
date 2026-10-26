@@ -542,17 +542,20 @@ print_pacman_section() {
 
 cmd_setup() {
   mkdir -p "$BASE"
-  # empty-but-present db: once the [pacgrab] section exists, a missing
-  # $REPO_NAME.db makes `pacman -Sy` fail for every repo, so seed an empty one
-  # first (same approach as cmd_clean's no-packages path).
-  if [ ! -f "$BASE/$REPO_NAME.db.tar.gz" ]; then
+  # empty-but-present db: once the [pacgrab] section exists, a missing or
+  # dangling $REPO_NAME.db makes `pacman -Sy` fail for every repo. Rebuild the
+  # empty db whenever no packages exist (cheap, idempotent) so a partial state
+  # left by an interrupted run is repaired, not skipped. When packages DO
+  # exist, leave the real repo db alone - `pacgrab repo` manages that.
+  if compgen -G "$BASE/*.pkg.tar.zst" >/dev/null; then
+    echo "repo db present ($BASE) - 'pacgrab repo' reindexes it after builds"
+  else
+    rm -f "$BASE/$REPO_NAME.db" "$BASE/$REPO_NAME.files"  # drop any dangling links
     tar czf "$BASE/$REPO_NAME.db.tar.gz" --files-from /dev/null
     tar czf "$BASE/$REPO_NAME.files.tar.gz" --files-from /dev/null
     ln -sf "$REPO_NAME.db.tar.gz" "$BASE/$REPO_NAME.db"
     ln -sf "$REPO_NAME.files.tar.gz" "$BASE/$REPO_NAME.files"
     echo "seeded empty repo db in $BASE"
-  else
-    echo "repo db already present in $BASE"
   fi
   # conf path overridable for testing / containers (default: system pacman.conf)
   local conf="${PACGRAB_PACMAN_CONF:-/etc/pacman.conf}"
@@ -1153,6 +1156,12 @@ aur_srcurls() {
 
 aur_fallback() { # $1=pkg: nothing grabbable -> ask before using the AUR helper
   local pkg="$1" helper
+  # adopt/migrate mode: the package is already installed, so never prompt to
+  # reinstall it through an AUR helper - just leave it managed by the AUR
+  if [ "${PACGRAB_ADOPT:-0}" = 1 ]; then
+    echo "$pkg: no grabbable download - leaving the installed AUR package as-is"
+    return 1
+  fi
   helper=$(aur_helper) || { echo "$pkg: no AUR helper (paru/yay) installed"; return 1; }
   if yesno "$pkg: no grabbable download - install through the AUR with ${helper##*/}?"; then
     wait_lock || return 1
@@ -1289,6 +1298,51 @@ cmd_S_one() { # $1=pkgname  $2=nobuild(0/1)
   # 6. nothing we can grab -> the AUR (drop any half-made recipe first)
   if [ "$made_dir" = 1 ]; then rm -rf "$BASE/$name"; fi
   aur_fallback "$pkg"
+}
+
+# migrate : turn every installed AUR package into a pacgrab recipe. Walks
+# `pacman -Qm` (foreign = installed but not in any sync repo = the AUR ones)
+# and runs each through the same grabber as `-S`, in adopt mode: nothing is
+# rebuilt (they are already installed) and the AUR-helper fallback is skipped.
+# Run `pacgrab build-all` afterwards if you want them rebuilt as pacgrab pkgs.
+cmd_migrate() {
+  need curl; need jq
+  local pkg ver row made=0 already=0 aur=0
+  # adopted packages are already installed - never prompt to reinstall via AUR
+  PACGRAB_ADOPT=1
+  export PACGRAB_ADOPT
+  local -a pkgs=()
+  # pacman -Qm: "<name> <version>" for every foreign (AUR) package
+  mapfile -t pkgs < <(pacman -Qm 2>/dev/null | awk '{print $1"\t"$2}')
+  if [ ${#pkgs[@]} -eq 0 ]; then
+    echo "no installed AUR packages found - nothing to migrate"
+    return 0
+  fi
+  echo "migrating ${#pkgs[@]} installed AUR package(s) into pacgrab recipes..."
+  echo
+  for row in "${pkgs[@]}"; do
+    pkg=${row%%$'\t'*}; ver=${row#*$'\t'}
+    [ -n "$pkg" ] || continue
+    # a recipe that already exists is left alone
+    if [ -f "$BASE/$pkg/PKGBUILD" ]; then
+      echo "$pkg: already a pacgrab recipe"; already=$((already+1)); continue
+    fi
+    if cmd_S_one "$pkg" 1 >/dev/null 2>&1; then
+      if [ -f "$BASE/$pkg/PKGBUILD" ]; then
+        echo "$pkg: migrated -> $BASE/$pkg"; made=$((made+1))
+      else
+        echo "$pkg: no recipe created (left on the AUR)"; aur=$((aur+1))
+      fi
+    else
+      echo "$pkg: could not migrate (left on the AUR)"; aur=$((aur+1))
+    fi
+  done
+  echo
+  echo "migrate: $made new recipe(s), $already already pacgrab, $aur left on the AUR"
+  if [ "$made" -gt 0 ]; then
+    echo "run 'pacgrab list' to see them, 'pacgrab build-all' to rebuild as pacgrab pkgs"
+  fi
+  return 0
 }
 
 cmd_prune() { # remove recipe dirs for packages that are not installed
@@ -1710,6 +1764,7 @@ cmd_help() {
     "update <name>|bump + rebuild one GitHub package"
     "sync [name ...]|install recipe desktops+icons directly, no rebuild"
     "refresh <name>|regenerate recipe from its URL with current code"
+    "migrate|make pacgrab recipes from every installed AUR package"
     "fix-conflicts|delete unowned files that would block pacgrab package installs"
     "prune [--yes]|delete recipes for apps that are not installed"
     "update-all|bump + rebuild all outdated GitHub packages"
@@ -1744,6 +1799,7 @@ case "${1:-help}" in
   update) shift; cmd_update "$@" ;;
   sync) shift; cmd_sync "$@" ;;
   refresh) shift; cmd_refresh "$@" ;;
+  migrate) cmd_migrate ;;
   fix-conflicts) cmd_fix_conflicts ;;
   prune) shift; cmd_prune "$@" ;;
   update-all) cmd_update_all ;;

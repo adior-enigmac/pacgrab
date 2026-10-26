@@ -95,6 +95,7 @@ pacgrab update-all        bump + rebuild all outdated GitHub packages
 pacgrab check             show which GitHub packages have updates
 pacgrab sync [name ...]   install recipe desktops+icons directly, no rebuild
 pacgrab refresh <name>    regenerate recipe from its URL with current code
+pacgrab migrate           make recipes from every installed AUR package
 pacgrab bump <p> [ver]    bump version: GitHub API or explicit version
 pacgrab edit <name>       open the PKGBUILD in $EDITOR
 pacgrab new <name> O/R    scaffold a recipe by hand from GitHub owner/repo
