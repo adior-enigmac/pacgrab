@@ -127,6 +127,31 @@ It also detects a `.desktop` and icon (falling back to the repo's own assets),
 and probes whether the app is terminal vs GUI so the generated `.desktop` sets
 `Terminal=` correctly.
 
+### Supported formats
+
+`pacgrab install` (and a bare URL) accept any of these, as a GitHub release URL
+or a direct download link:
+
+| Category          | Extensions                                                     | Handling                                          |
+| ----------------- | -------------------------------------------------------------- | ------------------------------------------------- |
+| Tarballs          | `.tar.gz` `.tgz` `.tar.xz` `.tar.bz2` `.tar.zst` `.tar.lzma`   | unpacked; layout auto-detected (see above)        |
+| Zip               | `.zip`                                                         | unpacked; layout auto-detected                    |
+| Other archives    | `.7z` `.cpio` `.rar` `.xz` `.bz2` `.zst` `.run`                | anything `bsdtar -tf` can list                    |
+| AppImage          | `.AppImage`                                                    | `.desktop`/icons extracted → `/opt/<pkg>`         |
+| Debian            | `.deb`                                                         | repacked from `data.tar.*`                        |
+| RPM               | `.rpm`                                                         | read as a generic archive via `bsdtar`            |
+| Bare binary       | *(no / unknown extension)*                                     | ELF magic (`\x7fELF`) detected → straight to `/usr/bin` |
+
+Two things worth calling out:
+
+- **GitHub auto-pick** — when resolving the latest release, pacgrab **prefers**
+  `.tar.gz` `.tgz` `.tar.xz` `.AppImage` `.deb` `.zip`, and skips ARM/aarch64,
+  macOS, Windows, `.exe`, source-only, and `.rpm` assets.
+- **Sniffing** — a file with no recognized extension isn't rejected: if `bsdtar`
+  can list it, it's treated as a tarball; if the first bytes are `\x7fELF`, it's
+  installed as a single binary (this is how `sonora-bin` and other bare-binary
+  releases work).
+
 ## Requirements
 
 - Arch Linux with `pacman` + `makepkg` (`base-devel`)
