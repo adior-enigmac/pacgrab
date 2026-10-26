@@ -557,6 +557,21 @@ cmd_setup() {
     ln -sf "$REPO_NAME.files.tar.gz" "$BASE/$REPO_NAME.files"
     echo "seeded empty repo db in $BASE"
   fi
+  # self-check: prove the db pacman will fetch is actually openable, and show
+  # the exact Server line + resolved path. A mismatch here (dangling symlink,
+  # bad perms, wrong Server path) is what makes `pacman -Sy` fail with
+  # "Could not open file .../pacgrab.db" - so surface it before pacman does.
+  local dbfile="$BASE/$REPO_NAME.db"
+  if [ ! -e "$dbfile" ]; then
+    echo "WARNING: $dbfile is missing - 'pacman -Sy' will fail for [$REPO_NAME]" >&2
+  elif [ ! -r "$dbfile" ]; then
+    echo "WARNING: $dbfile is not readable - 'pacman -Sy' will fail for [$REPO_NAME]" >&2
+  elif ! tar tzf "$dbfile" >/dev/null 2>&1; then
+    echo "WARNING: $dbfile is not a valid db archive - 'pacman -Sy' will fail" >&2
+  else
+    echo "db ok: $dbfile -> $(readlink -f "$dbfile") ($(stat -c%s "$dbfile" 2>/dev/null) bytes)"
+    echo "expect in pacman.conf:  Server = file://$BASE"
+  fi
   # conf path overridable for testing / containers (default: system pacman.conf)
   local conf="${PACGRAB_PACMAN_CONF:-/etc/pacman.conf}"
   if [ ! -f "$conf" ]; then
@@ -565,7 +580,19 @@ cmd_setup() {
     return 0
   fi
   if grep -q "^\[$REPO_NAME\]" "$conf" 2>/dev/null; then
-    echo "[$REPO_NAME] already present in $conf"
+    # present - but verify it points at THIS base. A stale/wrong Server path
+    # (e.g. from an old AUR_LOCAL, or a botched earlier edit) makes
+    # `pacman -Sy` fail with "Could not open file .../pacgrab.db".
+    local want="Server = file://$BASE" got
+    got=$(awk -v s="[$REPO_NAME]" '$0==s{f=1;next} /^\[/{f=0} f&&/^Server/{print;exit}' "$conf" 2>/dev/null)
+    if [ "$got" = "$want" ]; then
+      echo "[$REPO_NAME] already present and correct in $conf"
+    else
+      echo "WARNING: [$REPO_NAME] in $conf has a mismatched Server line:"
+      echo "         found: ${got:-<none>}"
+      echo "         want:  $want"
+      echo "         fix the block so 'pacgrab.db' resolves under $BASE."
+    fi
   else
     if grep -q '^\[local\]' "$conf" 2>/dev/null; then
       echo "WARNING: $conf has a [local] section - libalpm reserves that name,"
