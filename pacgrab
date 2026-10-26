@@ -1,0 +1,1699 @@
+#!/usr/bin/env bash
+# pacgrab - Gear Lever-like manager for local PKGBUILDs
+# Base: ~/pacgrab/<pkgname>/PKGBUILD
+# Usage: pacgrab <list|add|build|update|check|clean|repo|timer-install|...> [args]
+set -euo pipefail
+
+BASE="${AUR_LOCAL:-$HOME/pacgrab}"
+# pacgrab's own repo: the [NAME] section in /etc/pacman.conf and the db file
+# prefix. It must NOT be "local" - libalpm reserves that name for the
+# installed-packages database, so a [local] section makes every `pacman -Sy`
+# fail with "database already registered" (verified against pacman/libalpm).
+REPO_NAME="pacgrab"
+DB="$BASE/$REPO_NAME.db.tar.gz"
+
+die() { echo "error: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null || die "missing $1"; }
+
+wait_lock() { # wait up to $1 seconds (default 600) for the pacman db lock
+  local timeout="${1:-600}" waited=0
+  while [ -e /var/lib/pacman/db.lck ]; do
+    if [ "$waited" -ge "$timeout" ]; then
+      echo "pacman database still locked after ${timeout}s, giving up" >&2
+      return 1
+    fi
+    [ "$waited" -eq 0 ] && echo "pacman database locked, waiting for it to free up..."
+    sleep 5; waited=$((waited+5))
+  done
+}
+
+pkg_info() { # $1=dir -> "pkgname(s) pkgver-pkgrel"
+  bash -c 'source "$1/PKGBUILD" 2>/dev/null || exit 1
+    if declare -p pkgname 2>/dev/null | grep -q "declare -a"; then
+      echo "${pkgname[*]} $pkgver-$pkgrel"
+    else
+      echo "$pkgname $pkgver-$pkgrel"
+    fi' _ "$1" || echo "? ?"
+}
+
+# Every recipe's metadata from ONE bash process. Doing this per recipe cost 19
+# `bash -c` spawns plus `grep|head|grep` for the origin check - over a second
+# of fork overhead under load - where one spawn covers the whole run (each
+# PKGBUILD is read with builtins, no greps). Prints one line per dir:
+#   "<dir>\t<pkgname(s) pkgver-pkgrel>\t<grab|aur>"
+pkg_report() {
+  [ $# -gt 0 ] || return 0
+  bash -c 'for d do
+      src="$d/PKGBUILD"
+      [ -f "$src" ] || continue
+      info=$( source "$src" 2>/dev/null &&
+              if [[ $(declare -p pkgname 2>/dev/null) == "declare -a"* ]]; then
+                printf "%s %s-%s" "${pkgname[*]}" "$pkgver" "$pkgrel"
+              else
+                printf "%s %s-%s" "$pkgname" "$pkgver" "$pkgrel"
+              fi ) || info="? ?"
+      # origin: pacgrab generated it - either _pacgrab_* vars anywhere in the
+      # file, or the generator header on the first line (AUR imports keep the
+      # AUR maintainer line instead)
+      origin=aur first="" line=""
+      IFS= read -r first < "$src" 2>/dev/null || first=""
+      case "$first" in *"@"localhost*) origin=grab ;; esac
+      if [ "$origin" = aur ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+          case "$line" in _pacgrab_*) origin=grab; break ;; esac
+        done < "$src"
+      fi
+      printf "%s\t%s\t%s\n" "${d%/}" "$info" "$origin"
+    done' -- "$@"
+}
+
+# Installed versions by package name. `pacman -Q` costs ~0.2s per call, so we
+# take every name we care about and ask once - the map is then free to read.
+declare -A INSTALLED=()
+load_installed() { # $@=pkgnames -> fills INSTALLED
+  local n v
+  [ $# -gt 0 ] || return 0
+  while read -r n v; do
+    [ -n "${v:-}" ] && INSTALLED["$n"]="$v"
+  done < <(pacman -Q "$@" 2>/dev/null || true)
+  return 0
+}
+
+# $1=space-separated pkgnames -> the INSTALLED cell for the table
+installed_cell() {
+  local p n=0 total=0 out=""
+  for p in $1; do
+    total=$((total+1))
+    if [ -n "${INSTALLED[$p]:-}" ]; then
+      n=$((n+1))
+      out="${out:+$out, }$p ${INSTALLED[$p]}"
+    fi
+  done
+  if [ "$total" -gt 1 ]; then echo "$n/$total installed"
+  elif [ -n "$out" ]; then echo "$out"
+  else echo "-"
+  fi
+}
+
+cmd_list() {
+  local rows=() base info pns pv p d _origin
+  local -a all=()
+  # one process for every PKGBUILD instead of one `bash -c` + `basename` per recipe
+  while IFS=$'\t' read -r d info _origin; do
+    [ -n "$d" ] || continue
+    base=${d##*/}
+    pv=${info##* }; pns=${info% *}
+    rows+=("$base|$pns|$pv")
+    for p in $pns; do all+=("$p"); done
+  done < <(pkg_report "$BASE"/*/)
+  # one pacman call for every recipe, not one per package
+  load_installed "${all[@]}"
+  local w1=4 w2=10 w3=7 r c1 c2 c3 # headers: BASE PKGNAME(S) VERSION
+  for r in "${rows[@]}"; do
+    c1=${r%%|*}; r=${r#*|}; c2=${r%%|*}; r=${r#*|}; c3=${r%%|*}
+    [ ${#c1} -gt "$w1" ] && w1=${#c1}
+    [ ${#c2} -gt "$w2" ] && w2=${#c2}
+    [ ${#c3} -gt "$w3" ] && w3=${#c3}
+  done
+  printf "%-${w1}s %-${w2}s %-${w3}s %s\n" "BASE" "PKGNAME(S)" "VERSION" "INSTALLED"
+  for r in "${rows[@]}"; do
+    c1=${r%%|*}; r=${r#*|}; c2=${r%%|*}; r=${r#*|}; c3=${r#*|}
+    c4=$(installed_cell "$c2")
+    printf "%-${w1}s %-${w2}s %-${w3}s %s\n" "$c1" "$c2" "$c3" "$c4"
+  done
+}
+
+# who owns the handful of paths we care about, asked in ONE pacman call per
+# run. Loading whole file lists instead took 0.9s and 4.8MB to answer a
+# question about 19 desktop files; `pacman -Qo` answers them all at once.
+declare -A OWNER=()
+load_owned() { # $@=paths -> OWNER[path]=pkgname
+  local line path rest
+  [ $# -gt 0 ] || return 0
+  while IFS= read -r line; do
+    case "$line" in
+      *" is owned by "*)
+        path=${line%% is owned by *}
+        rest=${line#* is owned by }
+        OWNER[$path]=${rest% *}
+        ;;
+    esac
+  done < <(pacman -Qo "$@" 2>/dev/null || true)
+  return 0
+}
+
+# does one of these packages own this exact path? Pure bash lookup, no forks.
+ships_path() { # $1=pkgnames (space separated)  $2=path
+  local n owner=${OWNER[$2]:-}
+  [ -n "$owner" ] || return 1
+  for n in $1; do
+    if [ "$n" = "$owner" ]; then return 0; fi
+  done
+  return 1
+}
+
+# built package files belonging to a recipe, wherever makepkg put them.
+# Globs instead of `makepkg --packagelist`, which costs ~1.7s to spawn.
+built_pkgs() { # $1=recipe dir -> paths (may print nothing)
+  local d="$1" n info f
+  info=$(pkg_info "$d")
+  for n in ${info% *}; do
+    for f in "$d/$n"-*.pkg.tar.* "$PKGDEST_DIR/$n"-*.pkg.tar.*; do
+      if [ -f "$f" ]; then printf '%s\n' "$f"; fi
+    done
+  done
+  return 0
+}
+
+# A built package may sit in the recipe dir or, when PKGDEST points elsewhere
+# (the ArchWiki per-user ~/.config/pacman/makepkg.conf override, paru/yay), in
+# the makepkg cache. Print the path that actually exists.
+existing_pkg() { # $1=packagelist path -> path on disk
+  if [ -f "$1" ]; then echo "$1"; return 0; fi
+  local alt="$PKGDEST_DIR/$(basename "$1")"
+  if [ -f "$alt" ]; then echo "$alt"; return 0; fi
+  return 1
+}
+
+# file paths the recipe's package provides (empty when unknown). Prefers the
+# built artifact; without one falls back to the installed package's file list.
+# Reached only on sync's icon path, so its single `pacman -Qlq` is fine.
+# Never fails - callers run it inside $( ) under `set -e`.
+recipe_ships() {
+  local d="$1" n info f names
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    pacman -Qlpq "$f" 2>/dev/null || true
+    return 0
+  done < <(built_pkgs "$d")
+  info=$(pkg_info "$d")
+  names=${info% *}
+  [ -n "$names" ] || return 0
+  pacman -Qlq $names 2>/dev/null || true
+  return 0
+}
+
+# existing, non-directory files the package wants to install but that no
+# installed package owns -> exactly the paths pacman rejects with
+# "exists in filesystem". One batched `pacman -Qo` call (per 500 paths):
+# checking file-by-file costs a process spawn each and takes minutes.
+conflicts_of() { # $1=.pkg.tar.zst -> prints offending paths
+  local f batch=() out p
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    [ -d "$f" ] && continue
+    { [ -e "$f" ] || [ -L "$f" ]; } || continue
+    batch+=("$f")
+    if [ ${#batch[@]} -ge 500 ]; then
+      _unowned_of "${batch[@]}"; batch=()
+    fi
+  done < <(pacman -Qlpq "$1" 2>/dev/null)
+  [ ${#batch[@]} -gt 0 ] && _unowned_of "${batch[@]}"
+  return 0
+}
+
+_unowned_of() { # $@=existing paths -> print those pacman reports unowned
+  local out p
+  out=$(pacman -Qo "$@" 2>&1 >/dev/null) || true
+  # unowned paths come back on stderr as: error: No package owns /path
+  printf '%s\n' "$out" | grep -oP '(?<=No package owns ).*'
+}
+
+# `pacgrab sync` installs desktops/icons directly, so unowned copies can sit on
+# disk; pacman -U then aborts with "exists in filesystem". Remove such files
+# (unowned == no package claims them) right before installing.
+purge_conflicts() { # $1=recipe dir
+  local d="$1" p f
+  local p f
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      echo "  removing unowned file in the way: $f"
+      sudo rm -f "$f" || return 1
+    done < <(conflicts_of "$p")
+  done < <(built_pkgs "$d")
+  return 0
+}
+
+cmd_build() { # $@=pkgnames
+  [ $# -ge 1 ] || die "usage: $0 build <pkgname> [...]"
+  need makepkg
+  wait_lock || return 1
+  local fail=0 name d p q
+  local -a outpkgs=() realpkgs=()
+  for name in "$@"; do
+    d="$BASE/$name"
+    if [ ! -f "$d/PKGBUILD" ]; then echo "no PKGBUILD in $d, skipping"; fail=1; continue; fi
+    echo "=== $name ==="
+    ( cd "$d" && makepkg --printsrcinfo > .SRCINFO && makepkg -scf --noconfirm ) || { echo "FAILED: $name"; fail=1; continue; }
+    purge_conflicts "$d" || { echo "FAILED: $name (could not clear conflicts)"; fail=1; continue; }
+    mapfile -t outpkgs < <(cd "$d" && makepkg --packagelist 2>/dev/null)
+    if [ ${#outpkgs[@]} -eq 0 ]; then echo "FAILED: $name (no package produced)"; fail=1; continue; fi
+    # PKGDEST may send artifacts to a cache dir - only install what exists
+    realpkgs=()
+    for p in "${outpkgs[@]}"; do
+      if q=$(existing_pkg "$p"); then realpkgs+=("$q"); fi
+    done
+    if [ ${#realpkgs[@]} -eq 0 ]; then echo "FAILED: $name (artifact not found on disk)"; fail=1; continue; fi
+    # an artifact whose only entries are .PKGINFO/.MTREE/.BUILDINFO means
+    # package() extracted nothing: installing it succeeds silently and the app
+    # then has no desktop file, no icon and no binary (rofi finds nothing).
+    for p in "${realpkgs[@]}"; do
+      [ -f "$p" ] || continue
+      if ! bsdtar -tf "$p" 2>/dev/null | grep -qvE '^\.(PKGINFO|MTREE|BUILDINFO|INSTALL|CHANGELOG)$'; then
+        echo "FAILED: $name ($(basename "$p") is empty - package() installed nothing)"
+        fail=1
+        continue 2
+      fi
+    done
+    sudo pacman -U --noconfirm "${realpkgs[@]}" || { echo "FAILED: $name"; fail=1; continue; }
+    cmd_repo >/dev/null || true
+  done
+  return $fail
+}
+
+cmd_build_all() {
+  for d in "$BASE"/*/; do
+    [ -f "$d/PKGBUILD" ] || continue
+    name=$(basename "$d")
+    echo "=== $name ==="
+    cmd_build "$name" || echo "FAILED: $name"
+  done
+}
+
+cmd_uninstall() { # uninstall <name> [--purge]: pacman -R it; source dir stays unless --purge
+  [ $# -ge 1 ] || die "usage: $0 uninstall <name> [--purge]"
+  local target="$1" pkgs
+  if [ -f "$BASE/$target/PKGBUILD" ]; then
+    pkgs=$(bash -c 'source "$1/PKGBUILD" 2>/dev/null || exit 1
+      if declare -p pkgname 2>/dev/null | grep -q "declare -a"; then echo "${pkgname[@]}"; else echo "$pkgname"; fi' _ "$BASE/$target")
+  else
+    pkgs="$target" # not a pacgrab dir: try raw pacman name
+  fi
+  [ -n "$pkgs" ] || die "cannot resolve package for $target"
+  wait_lock || return 1
+  sudo pacman -Rns --noconfirm $pkgs
+  if [ "${2:-}" = "--purge" ] && [ -d "$BASE/$target" ]; then
+    rm -rf "$BASE/$target" && echo "purged $BASE/$target"
+  fi
+  cmd_repo >/dev/null 2>&1 || true
+}
+
+cmd_bump() { # bump <pkg> [newver]: github via API, or explicit version for pinned URLs
+  local d gh latest current
+  if [ $# -eq 2 ]; then
+    d="$BASE/$1"; local newver="$2"
+    [ -f "$d/PKGBUILD" ] || die "no PKGBUILD in $d"
+    # tight charset: this value is pasted into a sed replacement and into URL path
+    # segments - '/' or '&' there would corrupt the PKGBUILD or abort sed mid-write
+    [[ "$newver" =~ ^[0-9][0-9A-Za-z._+-]*$ ]] || die "invalid version '$newver' (letters, digits and ._+- only)"
+    current=$( ( source "$d/PKGBUILD" 2>/dev/null && echo "$pkgver" ) ) \
+      || die "$d/PKGBUILD is not sourceable - fix it first"
+    [ "$newver" != "$current" ] || { echo "$1 already at $current"; return 0; }
+    echo "$1: $current -> $newver"
+    need updpkgsums
+    # anchor to pkgver=: the old unanchored s/$current/$newver/g also rewrote
+    # _pacgrab_url/pkgdesc and digits INSIDE sha256sums, and an unescaped '.' in
+    # the pattern matched any character. URL-ish lines are swapped on purpose
+    # (pinned links carry the version in their path).
+    local esc_cur; esc_cur=$(printf '%s' "$current" | sed 's/[][\.*^$]/\\&/g')
+    sed -i "s/^pkgver=.*/pkgver=$newver/; s/^pkgrel=.*/pkgrel=1/" "$d/PKGBUILD"
+    sed -i "/^\(source\|_pacgrab_url\|url\|pkgdesc\)=/s|$esc_cur|$newver|g" "$d/PKGBUILD"
+    grep -q "^pkgver=$newver$" "$d/PKGBUILD" || die "bump failed: pkgver not written to $d/PKGBUILD"
+    ( cd "$d" && updpkgsums && makepkg --printsrcinfo > .SRCINFO ) \
+      || die "bump failed: could not refresh checksums in $d"
+    return 0
+  fi
+  [ $# -eq 1 ] || die "usage: $0 bump <pkgname> [new-version]"
+  d="$BASE/$1"
+  [ -f "$d/PKGBUILD" ] || die "no PKGBUILD in $d"
+  need curl; need updpkgsums
+  gh=$(grep -oP '^_github="\K[^"]+' "$d/PKGBUILD" || true)
+  [ -n "$gh" ] || die "no _github=\"OWNER/REPO\" in PKGBUILD"
+  latest=$(curl -fsSL "https://api.github.com/repos/$gh/releases/latest" | grep -oP '"tag_name":\s*"\Kv?[\d.]+' | head -1 || true)
+  [ -n "$latest" ] || die "could not fetch latest release for $gh"
+  latest=${latest#v}
+  current=$( ( source "$d/PKGBUILD" 2>/dev/null && echo "$pkgver" ) ) \
+    || die "$d/PKGBUILD is not sourceable - fix it first"
+  if [ "$latest" = "$current" ]; then echo "$1 already at $current"; return 0; fi
+  echo "$1: $current -> $latest"
+  sed -i "s/^pkgver=.*/pkgver=$latest/; s/^pkgrel=.*/pkgrel=1/" "$d/PKGBUILD"
+  # subshell so the leaked `cd` can't move the script's cwd, and so a failed
+  # updpkgsums is reported instead of leaving pkgver bumped with stale sums
+  ( cd "$d" && updpkgsums && makepkg --printsrcinfo > .SRCINFO ) \
+    || die "bump failed: could not refresh checksums in $d"
+}
+
+norm_ver() { printf '%s' "$1" | grep -oP '^\d+(\.\d+){0,3}' | awk -F. '{printf "%d.%d.%d", $1, $2+0, $3+0}'; }
+
+# $1=recipe dir -> print that recipe's one-line update status
+check_one() {
+  local d="$1" name gh cu cr current latest body rc=0
+  name=$(basename "$d")
+  gh=$(grep -oP '^_github="\K[^"]+' "$d/PKGBUILD" 2>/dev/null || true)
+  if [ -n "$gh" ]; then
+    current=$( ( source "$d/PKGBUILD" 2>/dev/null && echo "$pkgver" ) ) \
+      || { echo "$name: check failed - PKGBUILD not sourceable"; return 0; }
+    # a status check must never hang the command; and a failed fetch must not
+    # be reported as "up to date" (github rate-limits unauthenticated clients)
+    body=$(curl -fsSL --connect-timeout 5 --max-time 15 \
+      "https://api.github.com/repos/$gh/releases/latest" 2>/dev/null) || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      if [ "$rc" -eq 22 ]; then
+        echo "$name: check failed - github said no (rate limited? $current unchanged)"
+      else
+        echo "$name: check failed - github unreachable (rc=$rc, $current unchanged)"
+      fi
+      return 0
+    fi
+    latest=$(printf '%s' "$body" | grep -oP '"tag_name":\s*"\Kv?[\d.]+' | head -1 || true)
+    latest=${latest#v}
+    if [ -n "$latest" ] && [ "$latest" != "$current" ]; then
+      echo "$name: $current -> $latest ($gh)"
+    else
+      echo "$name: up to date ($current)"
+    fi
+    return 0
+  fi
+  # pinned-URL packages with a version feed (_check_url + _check_regex)
+  cu=$(grep -oP '^_check_url="\K[^"]+' "$d/PKGBUILD" 2>/dev/null || true)
+  current=$( ( source "$d/PKGBUILD" 2>/dev/null && echo "$pkgver" ) ) \
+    || { echo "$name: check failed - PKGBUILD not sourceable"; return 0; }
+  if [ -z "$cu" ]; then
+    # nothing to ask: a bare `return 0` here made check print only 8 of 20 lines,
+    # so report what IS knowable - the recipe's own version - instead of silence
+    if grep -q '^pkgver()' "$d/PKGBUILD" 2>/dev/null; then
+      echo "$name: VCS recipe (pkgver set at build, run: $0 build $name)"
+    else
+      echo "$name: no version feed ($current)"
+    fi
+    return 0
+  fi
+  cr=$(grep -oP '^_check_regex=\K.*' "$d/PKGBUILD" 2>/dev/null | sed "s/^'//; s/'$//" || true)
+  rc=0
+  body=$(curl -fsSL --compressed --connect-timeout 5 --max-time 15 "$cu" 2>/dev/null) || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "$name: check failed - could not reach the version feed (rc=$rc, $current unchanged)"
+    return 0
+  fi
+  latest=$(printf '%s\n' "$body" | grep -oP "$cr" | head -1 || true)
+  if [ -n "$latest" ] && [ "$(norm_ver "$latest")" != "$(norm_ver "$current")" ]; then
+    echo "$name: $current -> $latest available (re-pacgrab the new link)"
+  else
+    echo "$name: up to date ($current)"
+  fi
+}
+
+cmd_check() { # check for updates without bumping
+  # each recipe talks to a different server - run the lookups together rather
+  # than one curl after another, then print in directory order
+  local d outdir i=0 f
+  outdir=$(mktemp -d /tmp/opencode/pacgrab-check-XXXXXX) || return 1
+  for d in "$BASE"/*/; do
+    [ -f "$d/PKGBUILD" ] || continue
+    ( check_one "$d" >"$outdir/$i" ) &
+    i=$((i+1))
+  done
+  wait || true
+  for ((f=0; f<i; f++)); do
+    if [ -f "$outdir/$f" ]; then cat "$outdir/$f"; fi
+  done
+  rm -rf "$outdir"
+}
+
+cmd_edit() {
+  [ $# -eq 1 ] || die "usage: $0 edit <pkgname>"
+  "${EDITOR:-nano}" "$BASE/$1/PKGBUILD"
+}
+
+cmd_new() { # new <pkgname-bin> OWNER/REPO
+  [ $# -eq 2 ] || die "usage: $0 new <pkgname-bin> OWNER/REPO"
+  name="$1"; gh="$2"
+  d="$BASE/$name"
+  [ -e "$d" ] && die "$d exists"
+  mkdir -p "$d"
+  cat > "$d/PKGBUILD" <<EOF
+# Maintainer: $(whoami) <$(whoami)@localhost>
+pkgname=$name
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="$name built locally from GitHub releases"
+arch=('x86_64')
+url="https://github.com/$gh"
+license=('custom')
+depends=('hicolor-icon-theme')
+options=('!strip')
+_github="$gh"
+# EDIT: point to the real release asset, then run updpkgsums
+source=("\$pkgname-\$pkgver.tar.gz::https://github.com/$gh/releases/download/v\$pkgver/")
+sha256sums=('SKIP')
+
+package() {
+  cd "\$srcdir"
+  install -dm755 "\$pkgdir/opt/\$pkgname" "\$pkgdir/usr/bin"
+  cp -a * "\$pkgdir/opt/\$pkgname/"
+  ln -s "/opt/\$pkgname/\$pkgname" "\$pkgdir/usr/bin/\$pkgname"
+}
+EOF
+  cat > "$d/$name.desktop" <<EOF
+[Desktop Entry]
+Name=$name
+Exec=/usr/bin/$name
+Type=Application
+Categories=Utility;
+EOF
+  echo "created $d/PKGBUILD - edit source() then: $0 build $name"
+}
+
+PKGDEST_DIR="${PKGDEST:-${XDG_CACHE_HOME:-$HOME/.cache}/makepkg/pkg}"
+
+cmd_clean() {
+  find "$BASE" -maxdepth 2 -name '*.pkg.tar.zst*' -delete
+  # the index must not outlive its files: an entry whose package is gone makes
+  # `pacman -S` fail with "failed retrieving file", makes `pacman -Syu` abort
+  # on it, and makes `pacgrab -S` report "provided by [$REPO_NAME]" as a silent
+  # no-op. Keep an empty-but-present db: once the repo is configured, a
+  # missing $REPO_NAME.db makes `pacman -Sy` fail for every repo.
+  if compgen -G "$BASE/*.pkg.tar.zst" >/dev/null; then
+    cmd_repo >/dev/null || true
+  else
+    tar czf "$BASE/$REPO_NAME.db.tar.gz" --files-from /dev/null
+    tar czf "$BASE/$REPO_NAME.files.tar.gz" --files-from /dev/null
+    rm -f "$BASE/${REPO_NAME}.db.tar.gz.old" "$BASE/${REPO_NAME}.files.tar.gz.old"
+    # repo-add normally creates these; a plain tar does not, and without
+    # $REPO_NAME.db there is nothing for `pacman -Sy` to fetch
+    ln -sf "$REPO_NAME.db.tar.gz" "$BASE/$REPO_NAME.db"
+    ln -sf "$REPO_NAME.files.tar.gz" "$BASE/$REPO_NAME.files"
+  fi
+  for d in "$BASE"/*/; do
+    [ -d "$d" ] || continue
+    rm -rf "$d/src" "$d/pkg"
+  done
+  rm -rf /tmp/opencode/pacgrab-add* /tmp/opencode/aur-migrate
+  rm -f "${SRCDEST:-${XDG_CACHE_HOME:-$HOME/.cache}/makepkg/src}"/*.part
+  echo "cleaned pacgrab dirs + /tmp. Cache kept at $PKGDEST_DIR ($(du -sh "$PKGDEST_DIR" 2>/dev/null | cut -f1))."
+}
+
+cmd_repo() {
+  need repo-add
+  mapfile -t pkgs < <(find "$BASE" "$PKGDEST_DIR" -maxdepth 3 -name '*.pkg.tar.zst' ! -name '*-debug-*' 2>/dev/null | sort -u)
+  [ ${#pkgs[@]} -gt 0 ] || { echo "no packages to add"; return 0; }
+  # pacman downloads <Server>/<%FILENAME%> and FILENAME is only the basename,
+  # so the pool has to be flat under Server: makepkg puts artifacts in the
+  # recipe dir (or in PKGDEST), so hardlink them into $BASE and index the
+  # link - a hardlink, not a copy, so it costs no disk space. Once linked,
+  # find() sees both the link and the original, hence the basename dedupe.
+  local p f
+  local -A seen=()
+  local -a flat=()
+  for p in "${pkgs[@]}"; do
+    f="$BASE/${p##*/}"
+    if [ -n "${seen[$f]:-}" ]; then continue; fi
+    seen[$f]=1
+    if [ "$p" != "$f" ]; then
+      ln -f "$p" "$f" 2>/dev/null || { rm -f "$f"; cp -p "$p" "$f" 2>/dev/null || continue; }
+    fi
+    flat+=("$f")
+  done
+  cd "$BASE"
+  repo-add -q -R "$REPO_NAME.db.tar.gz" "${flat[@]}"
+  echo "repo updated: ${#flat[@]} package(s). Add to /etc/pacman.conf:"
+  echo "  [$REPO_NAME]"
+  echo '  SigLevel = Optional TrustAll'
+  echo "  Server = file://$BASE"
+  if grep -q '^\[local\]' /etc/pacman.conf 2>/dev/null; then
+    echo "  WARNING: /etc/pacman.conf already has a [local] section - libalpm"
+    echo "           reserves that name, so 'pacman -Sy' fails for every repo."
+    echo "           Remove it and use [$REPO_NAME] instead."
+  fi
+  return 0
+}
+
+# Paste a release URL (GitHub or any direct download) -> installs the app.
+# GitHub URLs also register for autoupdates. Generic URLs install fine but bump manually.
+# usage: install <url> [pkgname] [--no-build]
+cmd_add() {
+  need curl; need bsdtar; need makepkg
+  local url="${1:-}" force_name="${2:-}" nobuild=0
+  [ -n "$url" ] || die "usage: $0 install <url> [pkgname] [--no-build]"
+  if [ "$force_name" = "--no-build" ]; then force_name=""; nobuild=1; fi
+  if [ "${3:-}" = "--no-build" ]; then nobuild=1; fi
+
+  local gh="" tag="" asset aurl ver srcurl
+  if [[ "$url" =~ github\.com/([^/]+/[^/]+)/releases/download/([^/]+)/(.+)$ ]]; then
+    gh="${BASH_REMATCH[1]}"; tag="${BASH_REMATCH[2]}"; asset="${BASH_REMATCH[3]}"; aurl="$url"
+    ver="${tag#v}"; ver="${ver//-/_}"
+    local atmpl="${asset//$tag/v\$pkgver}"; [[ "$tag" == v* ]] || atmpl="${asset//$tag/\$pkgver}"
+    if [[ "$atmpl" == "$asset" ]]; then atmpl="${asset//$ver/\$pkgver}"; fi
+    if [[ "$tag" == v* ]]; then srcurl="https://github.com/$gh/releases/download/v\$pkgver/$atmpl"
+    else srcurl="https://github.com/$gh/releases/download/\$pkgver/$atmpl"; fi
+  elif [[ "$url" =~ github\.com/([^/]+/[^/]+?)(/.*)?$ ]]; then
+    gh="${BASH_REMATCH[1]}"
+    echo "resolving latest release for $gh..."
+    local json
+    json=$(curl -fsSL "https://api.github.com/repos/$gh/releases/latest") || die "GitHub API failed"
+    tag=$(printf '%s' "$json" | grep -oP '"tag_name":\s*"\K[^"]+' | head -1 || true)
+    [ -n "$tag" ] || die "no releases for $gh"
+    mapfile -t cands < <(printf '%s' "$json" | grep -oP '"browser_download_url":\s*"\K[^"]+')
+    aurl=$(printf '%s\n' "${cands[@]}" | grep -iP 'linux|x86_64|amd64|appimage|\.deb$' | grep -viP 'arm|aarch64|darwin|macos|windows|\.exe|source|\.rpm$' | grep -iP '\.tar\.gz$|\.tgz$|\.tar\.xz$|\.AppImage$|\.deb$|\.zip$' | head -1 || true)
+    [ -n "$aurl" ] || aurl=$(printf '%s\n' "${cands[@]}" | head -1)
+    [ -n "$aurl" ] || die "no downloadable asset in latest release"
+    asset="${aurl##*/}"
+    echo "picked: $asset ($tag)"
+    ver="${tag#v}"; ver="${ver//-/_}"
+    local atmpl="${asset//$tag/v\$pkgver}"; [[ "$tag" == v* ]] || atmpl="${asset//$tag/\$pkgver}"
+    if [[ "$atmpl" == "$asset" ]]; then atmpl="${asset//$ver/\$pkgver}"; fi
+    if [[ "$tag" == v* ]]; then srcurl="https://github.com/$gh/releases/download/v\$pkgver/$atmpl"
+    else srcurl="https://github.com/$gh/releases/download/\$pkgver/$atmpl"; fi
+  elif [[ "$url" =~ ^https?:// ]]; then
+    echo "generic URL (no GitHub autoupdate - bump manually with edit + build)"
+    aurl="$url"
+    asset="${aurl%%\?*}"; asset="${asset##*/}"
+    [ -n "$asset" ] || die "cannot derive filename from URL"
+    ver=$(printf '%s' "$url" | grep -oP '\d+\.\d+(\.\d+){0,3}' | head -1 || true)
+    [ -n "$ver" ] || { ver="1.0.0"; echo "warn: no version in URL, using $ver (edit PKGBUILD)"; }
+    srcurl="$url" # pinned: generic hosts rarely keep a stable versioned pattern
+  else
+    die "not an http(s) URL: $url"
+  fi
+  asset=$(printf '%b' "${asset//%/\\x}") # decode %20 etc. into real characters
+  # default pkgname from asset: strip version, arch, extension, then -bin
+  # (asset/ver may be refined after download for generic URLs; see below)
+  local srcdest="${SRCDEST:-${XDG_CACHE_HOME:-$HOME/.cache}/makepkg/src}"
+  mkdir -p "$srcdest"
+  local tmp; tmp=$(mktemp -d /tmp/opencode/pacgrab-add-XXXXXX)
+  if [ -z "$gh" ]; then
+    # cheap redirect resolution so query-string URLs get their real filename
+    local eff
+    eff=$(curl -fsSIL --retry 3 --retry-all-errors --retry-delay 2 -o /dev/null -w '%{url_effective}' "$aurl" 2>/dev/null || true)
+    [ -n "$eff" ] || eff="$aurl"
+    local effbase="${eff%%\?*}"; effbase="${effbase##*/}"
+    effbase=$(printf '%b' "${effbase//%/\\x}") # decode %20 etc.
+    if [[ "$effbase" =~ \.(tar\.gz|tgz|tar\.xz|tar\.bz2|zip|deb|AppImage|rpm)$ ]]; then
+      asset="$effbase"
+      ver=$(printf '%s' "$eff" | grep -oP '\d+\.\d+(\.\d+){0,3}' | head -1 || true)
+      [ -n "$ver" ] || ver="1.0.0"
+    fi
+    echo "resolved: $asset ($ver)"
+  fi
+  # deterministic cache path: reuse across runs, resume partials
+  local final="$srcdest/$asset"
+  if [ ! -f "$final" ]; then
+    # tolerate a previously cached percent-encoded twin (same bytes, %20 name)
+    for twin in "$srcdest"/*; do
+      [ -f "$twin" ] || continue
+      tb="${twin##*/}"
+      if [ "$(printf '%b' "${tb//%/\\x}")" = "$asset" ]; then
+        echo "reusing cached twin $tb"
+        cp -a "$twin" "$final"
+        [ -f "$twin.url" ] && cp -a "$twin.url" "$final.url"
+        break
+      fi
+    done
+  fi
+  # remember which URL produced a cached blob: the cache key is the filename only,
+  # and that is constant for URLs whose path carries no version (rolling "latest"
+  # endpoints, vendor paths with a build id) - without this, refresh skips the
+  # download and re-hashes stale bytes into sha256sums, which makepkg then rejects.
+  local want_url="${eff:-$aurl}"
+  if [ -f "$final" ] && { [ ! -f "$final.url" ] || [ "$(cat "$final.url")" != "$want_url" ]; }; then
+    echo "cached source is from a different URL, re-downloading $asset"
+    rm -f "$final" "$final.part" "$final.url"
+  fi
+  local dl="$final.part"
+  if [ -f "$final" ]; then
+    echo "using cached $asset, skipping download"
+  else
+    echo "downloading $asset..."
+    [ -f "$dl" ] && echo "resuming from $(du -h "$dl" | cut -f1)"
+    curl -fSL --retry 5 --retry-all-errors --retry-delay 5 -C - -o "$dl" "$aurl" || die "download failed"
+    if [[ "$asset" != *.* ]] && bsdtar -tf "$dl" >/dev/null 2>&1; then
+      asset="$asset.tar.gz" # sniffed archive, unknown extension
+    fi
+    final="$srcdest/$asset"; mv "$dl" "$final"
+    printf '%s' "$want_url" > "$final.url"
+  fi
+  local sum; sum=$(sha256sum "$final" | cut -d' ' -f1)
+  ln -sf "$final" "$tmp/$asset" # inspect from tmp, source of truth stays in srcdest cache
+
+  local stem="$asset" name
+  stem="${stem%.tar.gz}"; stem="${stem%.tgz}"; stem="${stem%.tar.xz}"; stem="${stem%.zip}"; stem="${stem%.deb}"; stem="${stem%.AppImage}"
+  stem="${stem//-/_}"; stem="${stem//$ver/}" # remove version if embedded
+  stem=$(printf '%s' "$stem" | sed -E 's/[-_]+(linux|x86_64|amd64|aarch64|arm64|unknown|musl|darwin|windows|apple|pc|static|gnu).*//I; s/[-_]+v$//I; s/[-_.]+$//; s/[-_[:space:]]+/-/g')
+  stem=$(printf '%s' "$stem" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9@._+-]/-/g; s/-+/-/g')
+  [ -n "$stem" ] || stem="app"
+  name="${force_name:-${stem}-bin}"
+  local d="$BASE/$name"
+  if [ -e "$d" ]; then
+    if pacman -Q "$name" >/dev/null 2>&1; then
+      die "$d exists and $name is installed (pacgrab build $name to reinstall)"
+    else
+      echo "$d exists but $name is not installed - building..."
+      cmd_build "$name"
+      return 0
+    fi
+  fi
+
+  echo "inspecting..."
+  local listing="$tmp/listing.txt"
+  local kind="unknown" top="" binname="" binpath="" desktop="" icon_rel="" icon_full=""
+  : > "$listing" # deb/appimage list no archive, but the greps below still run
+  if [[ "$asset" == *.AppImage ]]; then
+    kind="appimage"
+    chmod +x "$tmp/$asset"
+    ( cd "$tmp" && "./$asset" --appimage-extract '*.desktop' '*.png' '*.svg' >/dev/null 2>&1 ) || true
+    desktop=$(find "$tmp/squashfs-root" -maxdepth 1 -name '*.desktop' -printf '%f\n' 2>/dev/null | head -1)
+    binname="${desktop%.desktop}"; [ -z "$binname" ] && binname="$stem"
+  elif [[ "$asset" == *.deb ]]; then
+    kind="deb"
+  else
+    if ! bsdtar -tf "$tmp/$asset" > "$listing" 2>/dev/null; then
+      if [ "$(head -c 4 "$tmp/$asset")" = "$(printf '\177ELF')" ]; then
+        kind="rawbin" # bare ELF like sonora's release asset: straight to /usr/bin
+        binname="${name%-bin}"
+      else
+        die "cannot list archive $asset (not a supported archive or binary?)"
+      fi
+    else
+    top=$(head -1 "$listing" | cut -d/ -f1)
+    if grep -q "^$top/bin/" "$listing" && grep -q "^$top/share/" "$listing"; then
+      kind="structured" # like artcraft: bin/ + share/
+      binname=$(grep -oP "^$top/bin/\K[^/]+" "$listing" | head -1 || true)
+      binpath="bin/$binname"
+    elif grep -q "share/applications/.*\.desktop$" "$listing"; then
+      kind="structured"
+      desktop=$(grep -oP "share/applications/\K.*\.desktop$" "$listing" | head -1 || true)
+      binname=$(grep -oP "^$top/bin/\K[^/]+" "$listing" | head -1 || true)
+      [ -z "$binname" ] && binname="$stem"
+      binpath="bin/$binname"
+    elif grep -qE '(^|/)(index\.theme|cursor\.theme)$' "$listing" && grep -qE '(^|/)cursors/$' "$listing"; then
+      kind="cursortheme" # cursor/icon theme: theme dirs -> /usr/share/icons, no binary/desktop
+      binname="$stem"
+    elif grep -q "^$top/bin/.*\.sh$" "$listing"; then      kind="opttree" # like android-studio: whole tree -> /opt, launcher script symlinked
+      binpath=$(grep -oP "^$top/bin/\K[^/]+" "$listing" | grep -i "$stem" | head -1 || true)
+      [ -z "$binpath" ] && binpath=$(grep -oP "^$top/bin/\K[^/]+\.sh$" "$listing" | head -1 || true)
+      [ -z "$binpath" ] && binpath=$(grep -oP "^$top/bin/\K[^/]+" "$listing" | head -1 || true)
+      binpath="bin/$binpath"
+      binname="${name%-bin}"
+    else
+      # apptree like discord: launcher binary matching app name somewhere in tree
+      # dash/underscore-insensitive both ways (stem discordcanary = file discord-canary)
+      local fuzzy; fuzzy=$(printf '%s' "$stem" | sed 's/./&[ _-]?/g')
+      binpath=$(grep -v '/$' "$listing" | grep -viP '/(man|doc|include|tests?|examples?|locale|assets|static|completions)/' | grep -iP "^$top/(.*/)?[^/]*$fuzzy[^/]*$" | grep -viP '\.(png|svg|xpm|ico|gif|jpe?g|webp|bmp|tiff|mp4|webm|mkv|ogg|mp3|wav|flac|opus|ttf|otf|woff2?|txt|md|html|desktop|xml|json|c|h|o|a|m4|am|in|ac|la|pc|[1-9]|so(\..*)?)$' | awk -F/ '{print NF-1, $0}' | sort -n | cut -d' ' -f2- | head -1 || true)
+      if [ -n "$binpath" ]; then
+        kind="opttree"
+        local _ldir="${binpath%/*}"
+        binpath="${binpath#$top/}"; binname="${name%-bin}"
+        [ -z "$icon_rel" ] && icon_rel=$(grep -oP "^${_ldir}/[^/]+\.(png|svg)$" "$listing" | head -1 || true)
+      else
+        # single binary: top-level file, else the lone file one level down
+        binname=$(grep -v '/$' "$listing" | grep -v '/' | head -1 | xargs basename 2>/dev/null || true)
+        kind="singlebin"; binpath=""
+        if [ -z "$binname" ]; then
+          binpath=$(grep -v '/$' "$listing" | head -1 || true)
+          binpath="${binpath#$top/}"; binname="$(basename "$binpath")"
+        fi
+      fi
+    fi
+    # icon: prefer share icons, else bin/ art, else beside the launcher
+    [ -z "$icon_rel" ] && icon_rel=$(grep -oP "^$top/share/icons/hicolor/[^ ]+\.(png|svg)$" "$listing" | head -1 || true)
+    [ -z "$icon_rel" ] && icon_rel=$(grep -oP "^$top/share/pixmaps/[^ ]+\.(png|svg|xpm)$" "$listing" | head -1 || true)
+    [ -z "$icon_rel" ] && icon_rel=$(grep -oP "^$top/bin/[^/]+\.(png|svg)$" "$listing" | head -1 || true)
+    if [ -z "$icon_rel" ] && [ -n "${binpath:-}" ]; then
+      icon_rel=$(grep -oP "^$top/${binpath%/*}/[^/]+\.(png|svg)$" "$listing" | head -1 || true)
+    fi
+    # deep fallbacks, shallowest first: app-named art, linux resource dirs, icon/logo files
+    [ -z "$icon_rel" ] && icon_rel=$(grep -iP "^.*/[^/]*$binname[^/]*\.(png|svg)$" "$listing" | awk -F/ '{print NF-1, $0}' | sort -n | cut -d' ' -f2- | head -1 || true)
+    [ -z "$icon_rel" ] && icon_rel=$(grep -iP "^$top/.*linux/[^/]*\.(png|svg)$" "$listing" | awk -F/ '{print NF-1, $0}' | sort -n | cut -d' ' -f2- | head -1 || true)
+    [ -z "$icon_rel" ] && icon_rel=$(grep -iP "^$top/.*(icon|logo)[^/]*\.(png|svg)$" "$listing" | awk -F/ '{print NF-1, $0}' | sort -n | cut -d' ' -f2- | head -1 || true)
+    icon_full="$icon_rel"
+    icon_rel="${icon_rel#$top/}"
+    fi # bsdtar listable
+  fi
+  [ -n "$binname" ] || binname="$stem"
+  # display name for .desktop: Title Case, dashes -> spaces
+  local display; display=$(printf '%s' "$binname" | tr '-' ' ' | awk '{for(i=1;i<=NF;i++) $i=toupper(substr($i,1,1)) substr($i,2)}1' | sed -E 's/\bIde\b/IDE/g; s/\bHd\b/HD/g; s/\b4k\b/4K/g; s/\b3d\b/3D/g; s/\bTv\b/TV/g; s/\bApi\b/API/g')
+  echo "layout: $kind, launcher: ${binpath:-$binname}"
+
+  local lic="custom"
+  grep -qi 'LICENSE-MIT' "$listing" 2>/dev/null && lic="MIT"
+  grep -qi 'LICENSE-APACHE' "$listing" 2>/dev/null && lic="'MIT' 'Apache-2.0'"
+
+  mkdir -p "$d"
+  # repo icon fallback: asset ships none but _github repo has one (e.g. doc/topgrade.png)
+  local iconsrc="" iconsum="" iconinst=""
+  if [ -z "$icon_rel" ] && [ -n "$gh" ] && [[ "$kind" != deb && "$kind" != appimage && "$kind" != cursortheme ]]; then
+    local tree pick
+    tree=$(curl -fsSL "https://api.github.com/repos/$gh/git/trees/HEAD?recursive=1" 2>/dev/null | grep -oP '"path":\s*"\K[^"]+\.(png|svg)' || true)
+    if [ -n "$tree" ]; then
+      pick=$(printf '%s\n' "$tree" | grep -iP "(^|/)$stem\.(svg|png)$" | grep -i '\.svg$' | head -1 || true)
+      [ -n "$pick" ] || pick=$(printf '%s\n' "$tree" | grep -iP "(^|/)$stem\.(png|svg)$" | head -1 || true)
+      [ -n "$pick" ] || pick=$(printf '%s\n' "$tree" | grep -iP '(^|/)(icon|logo)\.svg$' | head -1 || true)
+      [ -n "$pick" ] || pick=$(printf '%s\n' "$tree" | grep -iP '(^|/)(icon|logo)\.(png|svg)$' | head -1 || true)
+      if [ -n "$pick" ] && curl -fsSL -o "$tmp/repoicon.${pick##*.}" "https://raw.githubusercontent.com/$gh/HEAD/$pick" 2>/dev/null; then
+        local ifn="icon.${pick##*.}" isum; isum=$(sha256sum "$tmp/repoicon.${pick##*.}" | cut -d' ' -f1)
+        cp -a "$tmp/repoicon.${pick##*.}" "$srcdest/$ifn" 2>/dev/null || true
+        iconsrc="$iconsrc
+        \"$ifn::https://raw.githubusercontent.com/$gh/HEAD/$pick\""
+        iconsum="$iconsum
+            '$isum'"
+        if [[ "$ifn" == *.svg ]]; then
+          iconinst="  install -Dm644 \"\$srcdir/$ifn\" \"\$pkgdir/usr/share/icons/hicolor/scalable/apps/$binname.svg\""
+        else
+          iconinst="  install -Dm644 \"\$srcdir/$ifn\" \"\$pkgdir/usr/share/pixmaps/$binname.png\""
+        fi
+        icon_entry="$binname"
+        echo "repo icon: $pick"
+      fi
+    fi
+  fi
+  local pageurl="https://github.com/$gh" prov="GitHub releases"
+  if [ -z "$gh" ]; then
+    pageurl=$(printf '%s' "$aurl" | grep -oP '^https?://[^/]+')
+    prov="direct download"
+  fi
+  # top-level .desktop shipped in archive? (full path; e.g. assets/pacseek.desktop)
+  local topdesk=""
+  if [ -z "$desktop" ]; then
+    topdesk=$(grep -oP "^$top/[^/]+\.desktop$" "$listing" | head -1 || true)
+    [ -z "$topdesk" ] && topdesk=$(grep -oP "^[^/]+\.desktop$" "$listing" | head -1 || true)
+  fi
+  # .desktop handling (except deb/appimage which do their own)
+  local desk_install=""
+  if [[ "$kind" != deb && "$kind" != appimage && "$kind" != cursortheme ]]; then
+    local icon_entry="$binname"
+    if [ -n "$icon_rel" ]; then
+      if [[ "$icon_rel" == share/* ]]; then icon_entry="${icon_rel##*/}"; icon_entry="${icon_entry%.*}"
+      else icon_entry="/opt/$name/$icon_rel"; fi
+    fi
+    # desk_src: path as seen from package() cwd (opttree/structured cd into $top)
+    local desk_src="$topdesk" icon_install=""
+    if [[ "$kind" != singlebin && "$kind" != rawbin && "$kind" != deb && "$kind" != appimage ]]; then
+      desk_src="${topdesk##*/}"
+    fi
+    if [[ "$kind" == singlebin && -n "$icon_full" ]]; then
+      local isize; isize=$(printf '%s' "$icon_full" | grep -oP '\d+x\d+' | head -1 || true)
+      if [ -z "$isize" ]; then
+        [[ "$icon_full" == *.svg ]] && isize="scalable" || isize="256x256"
+      fi
+      icon_install="  install -Dm644 \"$icon_full\" \"\$pkgdir/usr/share/icons/hicolor/$isize/apps/$binname.${icon_full##*.}\""
+      icon_entry="$binname"
+    fi
+    # terminal apps need Terminal=true or launchers (rofi etc.) open nothing.
+    # probe the launcher: scripts and GUI-linked ELFs -> false, else true.
+    local terminal="true"
+    if [ -z "$topdesk" ] && [ -z "$desktop" ]; then
+      local probe="$tmp/probe-bin" ok=0 member=""
+      if [ "$kind" = rawbin ]; then
+        if cp -a "$final" "$probe" 2>/dev/null; then ok=1; fi
+      else
+        case "$kind" in
+          opttree|structured) member="$top/${binpath:-bin/$binname}" ;;
+          singlebin) member="${binpath:-$binname}" ;;
+        esac
+        if [ -n "$member" ]; then
+          if bsdtar -xOf "$tmp/$asset" "$member" > "$probe" 2>/dev/null; then ok=1; fi
+        fi
+      fi
+      if [ "$ok" = 1 ]; then
+        if head -c 2 "$probe" 2>/dev/null | grep -q '#!'; then terminal="false"
+        elif ldd "$probe" 2>/dev/null | grep -qiE 'libgtk|libqt[56]|libwx|libx11|libwayland|libglfw|libEGL|libGL\.|libvulkan'; then terminal="false"
+        fi
+      fi
+      rm -f "$probe"
+    fi
+    if [ -n "$topdesk" ]; then
+      desk_install="  install -Dm644 \"$desk_src\" \"\$pkgdir/usr/share/applications/$binname.desktop\"
+  sed -i \"s|^Exec=.*|Exec=/usr/bin/$binname|\" \"\$pkgdir/usr/share/applications/$binname.desktop\""
+      if [[ "$icon_entry" == /* ]]; then
+        desk_install="$desk_install
+  sed -i \"s|^Icon=.*|Icon=$icon_entry|\" \"\$pkgdir/usr/share/applications/$binname.desktop\""
+      fi
+    elif [ -z "$desktop" ] && [[ "$kind" != cursortheme ]]; then
+      cat > "$d/$binname.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=$display
+Exec=/usr/bin/$binname
+Icon=$icon_entry
+Terminal=$terminal
+Categories=Utility;
+EOF
+      desk_install="  install -Dm644 \"\$startdir/$binname.desktop\" \"\$pkgdir/usr/share/applications/$binname.desktop\""
+    fi
+  fi
+
+  case "$kind" in
+    structured)
+      cat > "$d/PKGBUILD" <<EOF
+# Maintainer: $(whoami) <$(whoami)@localhost> (generated by pacgrab install)
+pkgname=$name
+pkgver=$ver
+pkgrel=1
+pkgdesc="$binname local build ($prov)"
+arch=('x86_64')
+url="$pageurl"
+license=($lic)
+depends=('hicolor-icon-theme' 'gcc-libs' 'glibc')
+options=('!strip')
+_github="$gh"
+_pacgrab_url="$aurl"
+source=("$asset::$srcurl"$iconsrc)
+sha256sums=('$sum'$iconsum)
+
+package() {
+  cd "$top"
+  install -Dm755 bin/$binname -t "\$pkgdir/usr/bin/"
+  cp -a share "\$pkgdir/usr/"
+$desk_install
+$iconinst
+}
+EOF
+      ;;
+    appimage)
+      cat > "$d/PKGBUILD" <<EOF
+# Maintainer: $(whoami) <$(whoami)@localhost> (generated by pacgrab install)
+pkgname=$name
+pkgver=$ver
+pkgrel=1
+pkgdesc="$binname local build ($prov) (AppImage)"
+arch=('x86_64')
+url="$pageurl"
+license=($lic)
+depends=('hicolor-icon-theme' 'fuse2')
+options=('!strip')
+_github="$gh"
+_pacgrab_url="$aurl"
+source=("$asset::$srcurl"$iconsrc)
+sha256sums=('$sum'$iconsum)
+
+package() {
+  install -Dm755 "$asset" "\$pkgdir/opt/$name/$binname.AppImage"
+  ln -s "/opt/$name/$binname.AppImage" "\$pkgdir/usr/bin/$binname"
+  ./"$asset" --appimage-extract '*.desktop' >/dev/null 2>&1 || true
+  install -Dm644 squashfs-root/*.desktop "\$pkgdir/usr/share/applications/$binname.desktop" 2>/dev/null || true
+  sed -i "s|^Exec=.*|Exec=/usr/bin/$binname|" "\$pkgdir/usr/share/applications/$binname.desktop" 2>/dev/null || true
+$iconinst
+}
+EOF
+      ;;
+    deb)
+      cat > "$d/PKGBUILD" <<EOF
+# Maintainer: $(whoami) <$(whoami)@localhost> (generated by pacgrab install)
+pkgname=$name
+pkgver=$ver
+pkgrel=1
+pkgdesc="$binname local build ($prov) (deb repack)"
+arch=('x86_64')
+url="$pageurl"
+license=($lic)
+depends=('hicolor-icon-theme')
+options=('!strip')
+_github="$gh"
+_pacgrab_url="$aurl"
+source=("$asset::$srcurl"$iconsrc)
+sha256sums=('$sum'$iconsum)
+
+package() {
+  # -O MUST be bundled into the -xf option word: bsdtar stops parsing options at
+  # the archive name, so "... data.tar.* -O" parses -O as another *member*, writes
+  # 0 bytes, the pipe still exits 0, and makepkg ships an empty package. twindesk
+  # 2.2.0-1 installed nothing at all because of that (invisible to rofi/menus).
+  local member
+  member=\$(bsdtar -tf "$asset" | grep -m1 '^data\\.tar' || true)
+  [ -n "\$member" ] || { echo "pacgrab: no data.tar* member in $asset" >&2; return 1; }
+  bsdtar -xOf "$asset" "\$member" | bsdtar -x -C "\$pkgdir"
+  [ -n "\$(ls -A "\$pkgdir" 2>/dev/null)" ] || { echo "pacgrab: $asset unpacked to nothing" >&2; return 1; }
+$iconinst
+}
+EOF
+      ;;
+    opttree) # whole tree -> /opt, launcher symlinked, desktop generated if missing
+      cat > "$d/PKGBUILD" <<EOF
+# Maintainer: $(whoami) <$(whoami)@localhost> (generated by pacgrab install)
+pkgname=$name
+pkgver=$ver
+pkgrel=1
+pkgdesc="$binname local build ($prov)"
+arch=('x86_64')
+url="$pageurl"
+license=($lic)
+depends=('hicolor-icon-theme' 'gcc-libs' 'glibc')
+options=('!strip')
+_github="$gh"
+_pacgrab_url="$aurl"
+source=("$asset::$srcurl"$iconsrc)
+sha256sums=('$sum'$iconsum)
+
+package() {
+  cd "$top"
+  install -dm755 "\$pkgdir/opt/$name" "\$pkgdir/usr/bin"
+  cp -a * "\$pkgdir/opt/$name/"
+  ln -s "/opt/$name/$binpath" "\$pkgdir/usr/bin/$binname"
+$desk_install
+$iconinst
+}
+EOF
+      ;;
+    rawbin) # bare ELF binary -> straight to /usr/bin
+      # NB: keep this on its own line - joining the heredoc opener onto the comment
+      # makes the whole template execute as pacgrab's own shell instead of being
+      # written (and `EOF` then dies with "command not found")
+      cat > "$d/PKGBUILD" <<EOF
+# Maintainer: $(whoami) <$(whoami)@localhost> (generated by pacgrab install)
+pkgname=$name
+pkgver=$ver
+pkgrel=1
+pkgdesc="$binname local build ($prov)"
+arch=('x86_64')
+url="$pageurl"
+license=($lic)
+depends=('gcc-libs' 'glibc' 'hicolor-icon-theme')
+options=('!strip')
+_github="$gh"
+_pacgrab_url="$aurl"
+source=("$asset::$srcurl"$iconsrc)
+sha256sums=('$sum'$iconsum)
+
+package() {
+  install -Dm755 "$asset" "\$pkgdir/usr/bin/$binname"
+$desk_install
+$iconinst
+}
+EOF
+      ;;
+    cursortheme) # cursor theme dirs -> /usr/share/icons (no binary, no desktop)
+      cat > "$d/PKGBUILD" <<EOF
+# Maintainer: $(whoami) <$(whoami)@localhost> (generated by pacgrab install)
+pkgname=$name
+pkgver=$ver
+pkgrel=1
+pkgdesc="$binname cursor theme, local build ($prov)"
+arch=('any')
+url="$pageurl"
+license=($lic)
+_github="$gh"
+source=("$asset::$srcurl"$iconsrc)
+sha256sums=('$sum'$iconsum)
+
+package() {
+  install -dm755 "\$pkgdir/usr/share/icons"
+  for t in */; do
+    [ -d "\$t/cursors" ] && cp -a "\$t" "\$pkgdir/usr/share/icons/"
+  done
+}
+EOF
+      ;;
+    *) # singlebin -> /opt + symlink
+      cat > "$d/PKGBUILD" <<EOF
+# Maintainer: $(whoami) <$(whoami)@localhost> (generated by pacgrab install)
+pkgname=$name
+pkgver=$ver
+pkgrel=1
+pkgdesc="$binname local build ($prov)"
+arch=('x86_64')
+url="$pageurl"
+license=($lic)
+depends=('gcc-libs' 'glibc')
+options=('!strip')
+_github="$gh"
+_pacgrab_url="$aurl"
+source=("$asset::$srcurl"$iconsrc)
+sha256sums=('$sum'$iconsum)
+
+package() {
+  install -Dm755 "${binpath:-$binname}" "\$pkgdir/opt/$name/$binname"
+  install -dm755 "\$pkgdir/usr/bin"
+  ln -s "/opt/$name/$binname" "\$pkgdir/usr/bin/$binname"
+$desk_install
+$iconinst
+$icon_install
+}
+EOF
+      ;;
+  esac
+  # a branch that failed (or a heredoc that never opened, as in the rawbin bug)
+  # would otherwise report success while writing no recipe at all
+  if [ ! -f "$d/PKGBUILD" ]; then
+    rm -rf "$tmp"
+    die "internal: no PKGBUILD generated for $name ($kind)"
+  fi
+  ( cd "$d" && makepkg --printsrcinfo > .SRCINFO )
+  rm -rf "$tmp"
+  echo "created $d/PKGBUILD ($kind, $asset)"
+  if [ "$nobuild" -eq 0 ]; then
+    cmd_build "$name"
+  else
+    echo "skipped build (--no-build). run: $0 build $name"
+  fi
+}
+
+cmd_fix_conflicts() { # remove unowned files that any pacgrab package would install
+  local d removed=0 p f
+  for d in "$BASE"/*/; do
+    [ -f "$d/PKGBUILD" ] || continue
+    while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        echo "removing unowned conflict: $f  (would block $(basename "$p"))"
+        sudo rm -f "$f" && removed=$((removed+1))
+      done < <(conflicts_of "$p")
+    done < <(built_pkgs "$d")
+  done
+  echo "fix-conflicts: removed $removed orphaned file(s)."
+}
+
+_restore_tty() { # after reading a prompt from a pipe, give stdin back to the
+  # terminal - otherwise the sudo in the next step has no tty to ask with
+  [ -t 0 ] && return 0
+  if { : </dev/tty; } 2>/dev/null; then exec 0</dev/tty; fi
+  return 0
+}
+
+yesno() { # $1=prompt -> 0 only on an explicit yes (EOF/non-tty = no)
+  # printf (not `read -p`): read -p hides the prompt unless stdin is a tty
+  printf '%s [y/N] ' "$1" >&2
+  local ans=""
+  if ! read -r ans; then _restore_tty; return 1; fi
+  _restore_tty
+  [[ "$ans" =~ ^[Yy]$ ]]
+}
+
+aur_helper() { command -v paru 2>/dev/null || command -v yay 2>/dev/null; }
+
+# $1=AUR PKGBUILD -> its source[]/source_x86_64[] entries, one per line.
+# Elements are already expanded: bash expands them when the array is assigned
+# during `source`, so no second eval is needed.
+aur_srcurls() {
+  bash -c 'source "$1" 2>/dev/null || exit 0
+    for s in ${source[@]+"${source[@]}"} ${source_x86_64[@]+"${source_x86_64[@]}"}; do
+      printf "%s\n" "${s##*::}"
+    done' _ "$1" 2>/dev/null
+}
+
+aur_fallback() { # $1=pkg: nothing grabbable -> ask before using the AUR helper
+  local pkg="$1" helper
+  helper=$(aur_helper) || { echo "$pkg: no AUR helper (paru/yay) installed"; return 1; }
+  if yesno "$pkg: no grabbable download - install through the AUR with ${helper##*/}?"; then
+    wait_lock || return 1
+    "$helper" -S --noconfirm "$pkg"
+    return $?
+  fi
+  echo "$pkg: skipped (AUR fallback declined)"
+  return 1
+}
+
+# -S <pkg> [...] [--no-build] : AUR replacement. Find where the project itself
+# publishes downloads and build one of those into a pacgrab recipe; only hand
+# off to the AUR helper when the upstream has no normal download we can grab.
+cmd_S() {
+  need curl; need jq
+  local nobuild=0 fail=0 a pkg
+  local -a pkgs=()
+  for a in "$@"; do
+    case "$a" in
+      --no-build) nobuild=1 ;;
+      -*) die "unknown option: $a (usage: $0 -S <pkgname> [...] [--no-build])" ;;
+      *) pkgs+=("$a") ;;
+    esac
+  done
+  [ ${#pkgs[@]} -ge 1 ] || die "usage: $0 -S <pkgname> [...] [--no-build]"
+  for pkg in "${pkgs[@]}"; do
+    cmd_S_one "$pkg" "$nobuild" || fail=1
+  done
+  return $fail
+}
+
+cmd_S_one() { # $1=pkgname  $2=nobuild(0/1)
+  local pkg="$1" nobuild="${2:-0}"
+  local json base name aurl tmp npkgs cand pick ghurl
+  local -a addargs=()
+
+  # 1. already one of ours -> just (re)build it
+  if [ -f "$BASE/$pkg/PKGBUILD" ]; then
+    if [ "$nobuild" = 1 ]; then echo "$pkg: already a pacgrab recipe (build skipped)"; return 0; fi
+    echo "$pkg: already a pacgrab recipe, rebuilding"
+    cmd_build "$pkg"; return $?
+  fi
+
+  # 2. any sync repo (cachyos-*, core, extra, ...) belongs to pacman -
+  #    this only replaces the AUR. $REPO_NAME is pacgrab's own repo.
+  local -a sync_repos=()
+  mapfile -t sync_repos < <(pacman -Si "$pkg" 2>/dev/null | awk -F': *' '/^Repository/ {print $2}')
+  if [ ${#sync_repos[@]} -gt 0 ]; then
+    local r is_local=1
+    for r in "${sync_repos[@]}"; do [ "$r" != "$REPO_NAME" ] && is_local=0; done
+    if [ "$is_local" = 0 ]; then
+      echo "$pkg: official package (${sync_repos[*]}) - pacman manages it, not the AUR"
+      if yesno "$pkg: install from the official repos with pacman?"; then
+        wait_lock || return 1
+        sudo pacman -S --noconfirm "$pkg" || return 1
+      fi
+      return 0
+    fi
+    echo "$pkg: provided by the pacgrab [$REPO_NAME] repo (build it with: pacgrab build $pkg)"
+    return 0
+  fi
+
+  # 3. the AUR only tells us where the project lives - never its payload
+  json=$(curl -fsSL -G --data-urlencode "arg[]=$pkg" "https://aur.archlinux.org/rpc/v5/info") \
+    || { echo "$pkg: AUR lookup failed"; return 1; }
+  jq -e '.resultcount > 0' >/dev/null <<<"$json" \
+    || { echo "$pkg: not in the official repos and not in the AUR"; return 1; }
+  base=$(jq -r '.results[0].PackageBase' <<<"$json")
+  name=$(jq -r '.results[0].Name' <<<"$json")
+  aurl=$(jq -r '.results[0].URL' <<<"$json")
+  echo "$pkg: in the AUR as $base (upstream: ${aurl:-unknown})"
+  # 1 if this recipe dir isn't there yet, so a failed grab can undo itself
+  local made_dir=1; [ -e "$BASE/$name" ] && made_dir=0
+
+  tmp=$(mktemp -d /tmp/opencode/pacgrab-S-XXXXXX)
+  if ! curl -fsSL "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=$base" -o "$tmp/PKGBUILD"; then
+    rm -rf "$tmp"; echo "$pkg: cannot fetch the AUR PKGBUILD for $base"; return 1
+  fi
+
+  # split packages don't fit a single-package recipe
+  npkgs=$(bash -c 'source "$1" 2>/dev/null || { echo 0; exit 0; }
+    if declare -p pkgname 2>/dev/null | grep -q "declare -a"; then echo "${#pkgname[@]}"; else echo 1; fi' _ "$tmp/PKGBUILD")
+  if [ "${npkgs:-0}" -gt 1 ] 2>/dev/null; then
+    rm -rf "$tmp"
+    echo "$pkg: split AUR package ($npkgs pkgs in one PKGBUILD) - needs the AUR"
+    aur_fallback "$pkg"; return $?
+  fi
+
+  # 4. a real, prebuilt download from the project itself?
+  cand=$(aur_srcurls "$tmp/PKGBUILD")
+  pick=$(printf '%s\n' "$cand" | grep -iP '^https?://' \
+    | grep -viP '\.git($|\?)|git\+|/(archive|tarball|zipball)/|/tags/|pypi\.|pythonhosted|crates\.io|\.patch($|\?)|\.diff($|\?)|\.hook($|\?)|\.install($|\?)|\.sig($|\?)|\.asc($|\?)' \
+    | grep -iP 'releases?/|x86_64|amd64|aarch64|arm64|linux|appimage|\.deb$' \
+    | grep -iP '\.(AppImage|deb|tgz|tar\.(gz|xz|bz2|zst|lzma)|zip|7z|run|zst|xz|bz2)$' \
+    | grep -viP '\.pkg\.(tar\.)?(zst|xz|gz|bz2)$' | head -1 || true)
+  if [ -z "$pick" ] && printf '%s\n' "$cand" | grep -qiP '\.pkg\.(tar\.)?(zst|xz|gz|bz2)$'; then
+    echo "$pkg: upstream ships only a prebuilt Arch package - not recipe-able"
+  fi
+  rm -rf "$tmp"
+
+  if [ -n "$pick" ]; then
+    echo "$pkg: grabbing the project's own download: $pick"
+    addargs=("$pick" "$name"); [ "$nobuild" = 1 ] && addargs+=(--no-build)
+    if ( cmd_add "${addargs[@]}" ); then return 0; fi
+    echo "$pkg: could not make a recipe from that URL"
+    if [ "$made_dir" = 1 ]; then rm -rf "$BASE/$name"; fi
+    aur_fallback "$pkg"; return $?
+  fi
+
+  # 5. AUR source is only a checkout? try the project's GitHub releases.
+  #    Look at the real source (git+/archive URLs), not just the homepage,
+  #    and only if the release ships something that looks like an app -
+  #    some projects' "releases" are just images or source snapshots.
+  local repo_hint="$aurl" rel assets
+  if printf '%s\n' "$cand" | grep -qiP 'github\.com'; then
+    repo_hint=$(printf '%s\n' "$cand" | grep -iP 'github\.com' | head -1)
+  fi
+  if [[ "$repo_hint" =~ github\.com[:/]([^/]+/[^/?#]+) ]]; then
+    ghurl="${BASH_REMATCH[1]}"; ghurl="${ghurl%.git}"
+    rel=$(curl -fsSL --max-time 20 "https://api.github.com/repos/$ghurl/releases/latest" 2>/dev/null || true)
+    assets=$(printf '%s' "$rel" | jq -r '.assets[]?.name' 2>/dev/null || true)
+    if printf '%s\n' "$assets" | grep -qiP '\.(AppImage|deb|tgz|tar\.(gz|xz|bz2|zst)|zip|7z|run|zst|xz)$|linux|x86_64|amd64|arm64'; then
+      echo "$pkg: AUR source is only a checkout - using github.com/$ghurl releases"
+      addargs=("https://github.com/$ghurl" "$name"); [ "$nobuild" = 1 ] && addargs+=(--no-build)
+      if ( cmd_add "${addargs[@]}" ); then return 0; fi
+      echo "$pkg: could not turn a GitHub release into a recipe"
+    elif [ -n "$assets" ]; then
+      echo "$pkg: github.com/$ghurl releases carry no app download ($(printf '%s' "$assets" | tr '\n' ' '))"
+    else
+      echo "$pkg: github.com/$ghurl publishes no release assets"
+    fi
+  fi
+
+  # 6. nothing we can grab -> the AUR (drop any half-made recipe first)
+  if [ "$made_dir" = 1 ]; then rm -rf "$BASE/$name"; fi
+  aur_fallback "$pkg"
+}
+
+cmd_prune() { # remove recipe dirs for packages that are not installed
+  local yes=0; [ "${1:-}" = "--yes" ] && yes=1
+  local dead=() d name pns p info row any _origin
+  local -a all=() rows=()
+  # one process for every PKGBUILD instead of `basename` + `bash -c` per recipe
+  while IFS=$'\t' read -r d info _origin; do
+    [ -n "$d" ] || continue
+    name=${d##*/}
+    # pkg_report reports "? ?" when the PKGBUILD would not source (syntax error
+    # from a half-saved edit) - that is NOT "not installed", so never delete it
+    if [ "$info" = "? ?" ]; then
+      echo "$name: skipped (PKGBUILD not sourceable - fix it first)"
+      continue
+    fi
+    pns=${info% *}
+    rows+=("$name|$pns")
+    for p in $pns; do all+=("$p"); done
+  done < <(pkg_report "$BASE"/*/)
+  load_installed "${all[@]}"   # one pacman call instead of one per package
+  for row in "${rows[@]}"; do
+    name=${row%%|*}; pns=${row#*|}
+    any=0
+    for p in $pns; do
+      if [ -n "${INSTALLED[$p]:-}" ]; then any=1; fi
+    done
+    if [ "$any" -eq 0 ]; then dead+=("$name"); fi
+  done
+  [ ${#dead[@]} -gt 0 ] || { echo "nothing to prune"; return 0; }
+  echo "not installed, removing recipes:"
+  printf '  %s\n' "${dead[@]}"
+  if [ "$yes" -eq 0 ]; then
+    ans=""
+    read -rp "delete ${#dead[@]} directorie(s)? [y/N] " ans || true
+    [[ "$ans" =~ ^[Yy]$ ]] || { echo "aborted"; return 0; }
+  fi
+  for name in "${dead[@]}"; do rm -rf "$BASE/$name"; done
+  echo "pruned ${#dead[@]}."
+}
+
+cmd_refresh() { # refresh <name>: regenerate its PKGBUILD from the original URL with current code
+  [ $# -eq 1 ] || die "usage: $0 refresh <name>"
+  local d="$BASE/$1"
+  [ -f "$d/PKGBUILD" ] || die "no PKGBUILD in $d"
+  local u
+  u=$(bash -c 'source "$1/PKGBUILD" 2>/dev/null || exit 1
+    [ -n "${_pacgrab_url:-}" ] && { echo "$_pacgrab_url"; exit 0; }
+    # arch-specific recipes declare source_x86_64=(); source[] is empty outside
+    # makepkg, so fall back to the arch (and any) arrays
+    set -- "${source[@]}"
+    [ $# -gt 0 ] || set -- "${source_x86_64[@]}"
+    [ $# -gt 0 ] || set -- "${source_any[@]}"
+    for s in "$@"; do
+      [ -n "$s" ] || continue
+      u="${s##*::}"; u=$(eval echo "\"$u\"")
+      # *://* not http*: VCS sources start with "git+", which an anchored http*
+      # rejected - every git recipe died as "no downloadable source"
+      case "$u" in *icon.png|*icon.svg) continue;; *://*) echo "$u"; break;; esac
+    done' _ "$d") || die "cannot determine original URL for $1"
+  [ -n "$u" ] || die "no downloadable source in $d/PKGBUILD"
+  # a VCS recipe is not generated from a download URL - say so instead of handing
+  # cmd_add something it can only reject
+  case "$u" in
+    git+*|svn+*|hg+*|bzr+*) die "$1: VCS recipe - not regenerable from a URL (edit the PKGBUILD instead)" ;;
+  esac
+  echo "original URL: $u"
+  local bak="$d.refresh-bak"
+  rm -rf "$bak"; mv "$d" "$bak"
+  # an interrupt between this mv and the end used to leave the recipe parked in
+  # $bak, where the NEXT refresh's `rm -rf "$bak"` destroyed the only copy
+  local restore='[ -d "$bak" ] && [ ! -f "$d/PKGBUILD" ] && { rm -rf "$d"; mv "$bak" "$d"; echo "refresh interrupted - restored $1 from backup" >&2; }'
+  trap "$restore" EXIT
+  trap "$restore; exit 130" INT
+  trap "$restore; exit 143" TERM
+  # "success" must mean a sourceable PKGBUILD exists, not merely cmd_add exiting 0
+  if cmd_add "$u" "$1" --no-build && [ -f "$d/PKGBUILD" ] \
+     && bash -c 'source "$1/PKGBUILD" 2>/dev/null' _ "$d"; then
+    trap - EXIT INT TERM
+    # keep the installed version stamp if user hadn't bumped (regenerate keeps code, not version)
+    rm -rf "$bak"; echo "refreshed $1 (run: $0 build $1)"
+  else
+    trap - EXIT INT TERM
+    rm -rf "$d"; mv "$bak" "$d"; die "refresh failed, restored backup"
+  fi
+}
+
+cmd_sync() { # $@=names (default: all): install recipe desktops+icons directly, no rebuild
+  local targets=() t
+  if [ $# -eq 0 ]; then
+    for d in "$BASE"/*/; do
+      if [ -f "$d/PKGBUILD" ]; then
+        t=${d%/}; targets+=("${t##*/}")
+      fi
+    done
+  else
+    targets=("$@")
+  fi
+  local fail=0 changed=0 name d desk base icon iconfile src url ext inst
+  local first want have info shipped names n f line _origin
+  local -A FIRST=() WANT=() NAMES=() DESK=()
+  local -a firsts=() deskpaths=() dirs=()
+  # resolve each recipe's package name(s), wanted version and desktop file in
+  # ONE process, then ask pacman exactly twice for the whole run: installed
+  # versions, and who owns those desktop paths. Per recipe this used to be a
+  # `bash -c`, a `find|head`, a `grep|head` and a `basename` - ~4 forks x 19.
+  for name in "${targets[@]}"; do
+    if [ -f "$BASE/$name/PKGBUILD" ]; then dirs+=("$BASE/$name"); fi
+  done
+  while IFS=$'\t' read -r d info _origin; do
+    [ -n "$d" ] || continue
+    name=${d##*/}
+    names=${info% *}
+    FIRST[$name]=${names%% *}
+    WANT[$name]=${info##* }
+    NAMES[$name]=$names
+    firsts+=("${names%% *}")
+    desk=""
+    for f in "$d"/*.desktop; do
+      if [ -f "$f" ]; then desk=$f; break; fi
+    done
+    DESK[$name]=$desk
+    if [ -n "$desk" ]; then
+      deskpaths+=("/usr/share/applications/${desk##*/}")
+    fi
+  done < <(pkg_report "${dirs[@]}")
+  load_installed "${firsts[@]}"
+  load_owned "${deskpaths[@]}"
+  for name in "${targets[@]}"; do
+    d="$BASE/$name"
+    [ -f "$d/PKGBUILD" ] || { echo "$name: no recipe, skipping"; fail=1; continue; }
+    desk=${DESK[$name]:-}
+    if [ -z "$desk" ]; then
+      # shipped-desktop recipe (desktop lives in the tarball, not the recipe dir):
+      # in sync iff installed version matches the recipe
+      first=${FIRST[$name]}; want=${WANT[$name]}
+      have=${INSTALLED[$first]:-}
+      if [ -n "$have" ] && [ "$have" = "$want" ]; then
+        echo "$name already in sync ($have)"
+      else
+        echo "$name: shipped desktop needs a build (run pacgrab build $name) [have: ${have:-none}, recipe: $want]"
+        fail=1
+      fi
+      continue
+    fi
+    base=${desk##*/}
+    inst="/usr/share/applications/$base"
+    # first Icon= line, read in bash instead of `grep|head` (2 forks x 19)
+    icon=""
+    while IFS= read -r line; do
+      case "$line" in
+        Icon=*) icon=${line#Icon=}; icon=${icon%$'\r'}; break ;;
+      esac
+    done < "$desk"
+    # never hand-install a path our package owns: an unowned copy left on disk
+    # makes the next `pacman -U` fail with "exists in filesystem". If the
+    # built package ships it, treat the package as the source of truth.
+    # (owner lookup is preloaded for every recipe in one `pacman -Qo`; the
+    # full file list is only built further down, at the icon check)
+    if ships_path "${NAMES[$name]}" "$inst"; then
+      first=${FIRST[$name]}; want=${WANT[$name]}
+      have=${INSTALLED[$first]:-}
+      if [ -n "$have" ] && [ "$have" = "$want" ]; then
+        echo "$name already in sync ($have, desktop provided by package)"
+      else
+        echo "$name: desktop ships with the package, needs a build (run pacgrab build $name) [have: ${have:-none}, recipe: $want]"
+        fail=1
+      fi
+      continue
+    fi
+    # icon already good?
+    iconfile=""
+    if [[ "$icon" == /* ]]; then
+      [ -f "$icon" ] && iconfile="absolute"
+    elif [ -n "$icon" ]; then
+      [ -f "/usr/share/pixmaps/$icon.png" ] && iconfile="pixmaps"
+      [ -f "/usr/share/pixmaps/$icon.svg" ] && iconfile="pixmaps"
+      [ -f "/usr/share/icons/hicolor/scalable/apps/$icon.svg" ] && iconfile="hicolor"
+      [ -f "/usr/share/icons/hicolor/256x256/apps/$icon.png" ] && iconfile="hicolor"
+    else
+      iconfile="none-needed"
+    fi
+    if cmp -s "$desk" "$inst" 2>/dev/null && [ -n "$iconfile" ]; then
+      first=${FIRST[$name]}; want=${WANT[$name]}
+      have=${INSTALLED[$first]:-}
+      echo "$name already in sync (${have:-$want})"
+      continue
+    fi
+    echo "syncing $base..."
+    sudo install -Dm644 "$desk" "$inst" || { fail=1; continue; }
+    changed=1
+    if [[ "$icon" == /* ]]; then
+      [ -f "$icon" ] || echo "$name: WARNING $icon missing on disk (payload not installed?)"
+    elif [ -n "$icon" ] && [ -z "$iconfile" ]; then
+        # if the package ships this icon, only a build may install it
+        # (this is the rare path - build the package's full file list here,
+        # not once per recipe on every run)
+        shipped=$(recipe_ships "$d") || shipped=""
+        if printf '%s\n' "$shipped" | grep -qE "/(icons/hicolor/[^/]+/apps|pixmaps)/$icon\.(svg|png)$"; then
+          echo "$name: icon provided by package (run pacgrab build $name)"
+          continue
+        fi
+        url=$(grep -oP '"icon\.(png|svg)::\K[^"]+' "$d/PKGBUILD" | head -1 || true)
+        if [ -n "$url" ]; then
+          ext="${url%%\?*}"; ext="${ext##*.}"
+          src="/tmp/opencode/pacgrab-icon-$icon.$ext"
+          echo "fetching icon for $icon..."
+          if curl -fsSL -o "$src" "$url"; then
+            if [[ "$src" == *.svg ]]; then
+              sudo install -Dm644 "$src" "/usr/share/icons/hicolor/scalable/apps/$icon.svg" || fail=1
+            else
+              sudo install -Dm644 "$src" "/usr/share/pixmaps/$icon.png" || fail=1
+            fi
+            rm -f "$src"
+          else
+            echo "$name: WARNING icon download failed"; fail=1
+          fi
+        else
+          echo "$name: WARNING no icon file for '$icon' and none bundled (run pacgrab build $name)"
+        fi
+    fi
+  done
+  if [ "$changed" -eq 1 ]; then
+    sudo update-desktop-database /usr/share/applications 2>/dev/null || true
+    sudo gtk-update-icon-cache -qf /usr/share/icons/hicolor 2>/dev/null || true
+  fi
+  return $fail
+}
+
+cmd_update() { # update <pkg>: github via API; floating direct URLs via re-resolve; pinned URLs need manual bump
+  [ $# -eq 1 ] || die "usage: $0 update <pkgname>"
+  local d="$BASE/$1" before after gh
+  [ -f "$d/PKGBUILD" ] || die "no PKGBUILD in $d"
+  before=$( ( source "$d/PKGBUILD" 2>/dev/null && echo "$pkgver" ) ) \
+    || die "$d/PKGBUILD is not sourceable - fix it first"
+  gh=$(grep -oP '^_github="\K[^"]+' "$d/PKGBUILD" || true)
+  if [ -z "$gh" ]; then
+    local u
+    u=$(bash -c 'source "$1/PKGBUILD" 2>/dev/null || exit 1
+      [ -n "${_pacgrab_url:-}" ] && { echo "$_pacgrab_url"; exit 0; }
+      # arch-specific recipes declare source_x86_64=(); sourced outside makepkg
+      # that leaves source[] empty, so skwd-suite-bin died as "no downloadable
+      # source" - fall back to the arch (and any) arrays
+      set -- "${source[@]}"
+      [ $# -gt 0 ] || set -- "${source_x86_64[@]}"
+      [ $# -gt 0 ] || set -- "${source_any[@]}"
+      for s in "$@"; do
+        [ -n "$s" ] || continue
+        u="${s##*::}"; u=$(eval echo "\"$u\"")
+        # not http*: VCS sources are "git+https://..." - an anchored http* match
+        # rejected every git recipe and died with "no downloadable source"
+        case "$u" in *icon.png|*icon.svg) continue;; *://*) echo "$u"; break;; esac
+      done' _ "$d")
+    [ -n "$u" ] || die "no downloadable source in $d/PKGBUILD"
+    # VCS sources (git+/svn+/hg+/bzr+) have no URL to re-resolve: either pkgver()
+    # recomputes it at build, or a #tag= pins it to pkgver. `refresh` cannot
+    # regenerate such a recipe, so report the state instead of dying/refetching.
+    case "$u" in
+      git+*|svn+*|hg+*|bzr+*)
+        if grep -q '^pkgver()' "$d/PKGBUILD" 2>/dev/null; then
+          echo "$1: VCS recipe - pkgver set at build (run: $0 build $1)"
+        else
+          echo "$1: VCS source pinned at $before (run: $0 edit $1, then build)"
+        fi
+        return 0 ;;
+    esac
+    if printf '%s' "$u" | grep -qP '\d+\.\d+'; then
+      # pinned URL: only auto-detect via feed if recipe has _check_url/_check_regex
+      cu=$(grep -oP '^_check_url="\K[^"]+' "$d/PKGBUILD" 2>/dev/null || true)
+      if [ -n "$cu" ]; then
+        cr=$(grep -oP '^_check_regex=\K.*' "$d/PKGBUILD" 2>/dev/null | sed "s/^'//; s/'$//" || true)
+        latest=$(curl -fsSL --compressed --max-time 30 "$cu" 2>/dev/null | grep -oP "$cr" | head -1 || true)
+        if [ -n "$latest" ] && [ "$(norm_ver "$latest")" != "$(norm_ver "$before")" ]; then
+          echo "$1: $before -> $latest available (re-pacgrab the new link)"
+        else
+          echo "$1 already latest ($before)"
+        fi
+        return 0
+      fi
+      echo "$1: version-pinned URL - bump manually (pacgrab edit $1, or re-pacgrab the new link)"
+      return 0
+    fi
+    cmd_refresh "$1" >/dev/null || { echo "$1: refresh failed (see error above)"; return 1; }
+    after=$( ( source "$d/PKGBUILD" 2>/dev/null && echo "$pkgver" ) ) \
+      || die "$1: refresh left an unreadable PKGBUILD - run: $0 refresh $1"
+    if [ "$before" != "$after" ]; then
+      echo "$1: $before -> $after"; cmd_build "$1"
+    else
+      echo "$1 already latest ($before)"
+    fi
+    return 0
+  fi
+  # cmd_update prints its own status line below - silence cmd_bump's (it echoes
+  # "already at"/"x -> y" too), errors still land on stderr via die()
+  cmd_bump "$1" >/dev/null || { echo "$1: bump failed (see error above)"; return 1; }
+  after=$( ( source "$d/PKGBUILD" 2>/dev/null && echo "$pkgver" ) ) \
+    || die "$1: bump left an unreadable PKGBUILD - run: $0 edit $1"
+  if [ "$before" != "$after" ]; then
+    cmd_build "$1"
+  else
+    echo "$1 already latest ($before)"
+  fi
+}
+
+cmd_update_all() { # bump+rebuild every _github package that is outdated
+  local n=0 failed=()
+  for d in "$BASE"/*/; do
+    [ -f "$d/PKGBUILD" ] || continue
+    grep -q '^_github=' "$d/PKGBUILD" || continue
+    local name; name=$(basename "$d")
+    echo "=== $name ==="
+    if cmd_update "$name"; then
+      n=$((n+1))
+    else
+      failed+=("$name")
+    fi
+  done
+  cmd_repo >/dev/null 2>&1 || true
+  echo "update-all done: $n checked, ${#failed[@]} failed${failed:+ (${failed[*]})}"
+}
+
+cmd_timer_install() { # install systemd user timer for weekly autoupdates
+  local unitdir="$HOME/.config/systemd/user"
+  mkdir -p "$unitdir" "$HOME/.local/share/pacgrab"
+  cat > "$unitdir/pacgrab-update.service" <<EOF
+[Unit]
+Description=pacgrab autoupdate (GitHub releases -> rebuild local packages)
+
+[Service]
+Type=oneshot
+ExecStart=$BASE/pacgrab update-all
+StandardOutput=append:%h/.local/share/pacgrab/update.log
+StandardError=append:%h/.local/share/pacgrab/update.log
+EOF
+  cat > "$unitdir/pacgrab-update.timer" <<EOF
+[Unit]
+Description=Weekly pacgrab autoupdate
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl --user daemon-reload
+  systemctl --user enable --now pacgrab-update.timer
+  echo "timer installed (weekly). log: ~/.local/share/pacgrab/update.log"
+}
+
+cmd_timer_remove() {
+  systemctl --user disable --now pacgrab-update.timer 2>/dev/null || true
+  rm -f "$HOME/.config/systemd/user/pacgrab-update.service" "$HOME/.config/systemd/user/pacgrab-update.timer"
+  systemctl --user daemon-reload
+  echo "timer removed"
+}
+
+# recipe [pkg...] : look inside the recipes. No args = one line per recipe;
+# names given = print those PKGBUILDs in full.
+cmd_recipe() {
+  local d p info n total status names origin pkg fail=0 r
+  local -a rows=() all=()
+  if [ $# -eq 0 ]; then
+    local found=0
+    # one process for every PKGBUILD: the old path forked 4x per recipe
+    # (`bash -c` + grep/head/grep) - ~1s of spawns under load, ~50ms here.
+    # Sourcing also resolves variables/split arrays (grep can't), and
+    # `makepkg --printsrcinfo` does the same at 2.4s per recipe.
+    while IFS=$'\t' read -r d info origin; do
+      [ -n "$d" ] || continue
+      found=1
+      names=${info% *}
+      rows+=("$d|$names|$origin")
+      for n in $names; do all+=("$n"); done
+    done < <(pkg_report "$BASE"/*/)
+    [ "$found" = 1 ] || { echo "no recipes in $BASE"; return 0; }
+    # one pacman call for every name in every recipe
+    load_installed "${all[@]}"
+    printf '%-26s %-46s %-6s %s\n' "RECIPE" "PKGNAME(S)" "FROM" "STATUS"
+    for r in "${rows[@]}"; do
+      d=${r%%|*}; r=${r#*|}; names=${r%%|*}; origin=${r#*|}
+      if [[ "$names" == *" "* ]]; then
+        n=0; total=0
+        for p in $names; do
+          total=$((total+1))
+          if [ -n "${INSTALLED[$p]:-}" ]; then n=$((n+1)); fi
+        done
+        status="$n/$total installed"
+      elif [ -n "${INSTALLED[$names]:-}" ]; then
+        status="$names ${INSTALLED[$names]}"
+      else
+        status="not installed"
+      fi
+      printf '%-26s %-46s %-6s %s\n' "${d##*/}" "${names% }" "$origin" "$status"
+    done
+    return 0
+  fi
+  for pkg in "$@"; do
+    p="$BASE/$pkg/PKGBUILD"
+    if [ ! -f "$p" ]; then echo "$pkg: no recipe in $BASE" >&2; fail=1; continue; fi
+    echo "=== $p"
+    cat "$p"
+    echo
+  done
+  return $fail
+}
+
+cmd_help() {
+  echo "pacgrab - paste a URL, get the app (~/pacgrab)"
+  echo
+  local cmds=(
+    "-S <pkg> [...]|AUR replacement: grab the project's own download (else AUR)"
+    "<url>|install app from a link (GitHub release or direct download)"
+    "list|show managed packages and install status"
+    "recipe [p ...]|look inside recipes: one line each, or print full PKGBUILD(s)"
+    "build <p> [...]|rebuild + reinstall one or more packages"
+    "build-all|rebuild + reinstall everything"
+    "uninstall <name>|remove the app (recipe stays; add --purge to delete it too)"
+    "update <name>|bump + rebuild one GitHub package"
+    "sync [name ...]|install recipe desktops+icons directly, no rebuild"
+    "refresh <name>|regenerate recipe from its URL with current code"
+    "fix-conflicts|delete unowned files that would block pacgrab package installs"
+    "prune [--yes]|delete recipes for apps that are not installed"
+    "update-all|bump + rebuild all outdated GitHub packages"
+    "check|show which GitHub packages have updates"
+    "bump <p> [ver]|bump version: GitHub API or explicit version"
+    "edit <name>|open the PKGBUILD in $EDITOR"
+    "new <name> O/R|scaffold a recipe by hand from GitHub owner/repo"
+    "clean|delete build leftovers and partial downloads"
+    "repo|regenerate the local pacman repo database"
+    "timer-install|weekly autoupdates via a systemd timer"
+    "timer-remove|remove the autoupdate timer"
+  )
+  local w=0 c t
+  for c in "${cmds[@]}"; do t=${c%%|*}; [ "${#t}" -gt "$w" ] && w=${#t}; done
+  for c in "${cmds[@]}"; do printf "  pacgrab %-${w}s  %s\n" "${c%%|*}" "${c#*|}"; done
+  echo
+  echo "GitHub links autoupdate. Other links install fine but bump manually."
+}
+
+case "${1:-help}" in
+  help|-h|--help) cmd_help ;;
+  list) cmd_list ;;
+  recipe|recipes) shift; cmd_recipe "$@" ;;
+  install|add) shift; cmd_add "$@" ;;
+  -S) shift; cmd_S "$@" ;;
+  http*://*) cmd_add "$@" ;; # bare URL -> install
+  build) shift; cmd_build "$@" ;;
+  uninstall) shift; cmd_uninstall "$@" ;;
+  build-all) cmd_build_all ;;
+  bump) shift; cmd_bump "$@" ;;
+  update) shift; cmd_update "$@" ;;
+  sync) shift; cmd_sync "$@" ;;
+  refresh) shift; cmd_refresh "$@" ;;
+  fix-conflicts) cmd_fix_conflicts ;;
+  prune) shift; cmd_prune "$@" ;;
+  update-all) cmd_update_all ;;
+  check) cmd_check ;;
+  edit) shift; cmd_edit "$@" ;;
+  new) shift; cmd_new "$@" ;;
+  clean) cmd_clean ;;
+  repo) cmd_repo ;;
+  timer-install) cmd_timer_install ;;
+  timer-remove) cmd_timer_remove ;;
+  *) cmd_help; exit 1;;
+esac

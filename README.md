@@ -1,0 +1,144 @@
+# pacgrab
+
+> Paste a URL, get the app. A "Gear Lever"-style manager for local PKGBUILDs on Arch Linux.
+
+`pacgrab` turns a GitHub release URL (or any direct download link) into a proper
+local Arch package. It generates a PKGBUILD, builds it with `makepkg`, serves the
+result from a local pacman repository, and keeps it up to date — so GUI apps that
+normally live outside the official repos (or on the AUR) install, update, and
+uninstall like any other package.
+
+- **`pacgrab`** — the CLI (pure Bash, no runtime deps beyond `pacman`/`makepkg`).
+- **`pacgrab-tui.sh`** — an optional [gum](https://github.com/charmbracelet/gum)-based TUI front-end.
+
+## Why
+
+Arch has `pacman` (official repos) and the AUR, but a lot of desktop apps are only
+published as a GitHub release tarball, an AppImage, a `.deb`, or a bare binary.
+`pacgrab` bridges that gap: it wraps any of those into a real package backed by a
+local repo, so you get version tracking, dependency handling, clean upgrades and
+uninstalls — without hand-writing a PKGBUILD or cluttering your AUR helper.
+
+## How it works
+
+Everything lives in a base directory (default `~/pacgrab`, override with
+`AUR_LOCAL`):
+
+```
+~/pacgrab/
+├── pacgrab                 # this tool
+├── pacgrab-tui.sh          # optional TUI
+├── <pkgname>/              # one recipe dir per app (generated)
+│   ├── PKGBUILD
+│   ├── .SRCINFO
+│   └── <pkgname>.desktop   # generated when the app ships none
+└── *.pkg.tar.zst           # the flat package "pool" served to pacman
+```
+
+`pacgrab repo` indexes the pool into a local database (`pacgrab.db`) that you add
+to `/etc/pacman.conf`. From then on the apps are ordinary packages: `pacman -Syu`
+upgrades them, `pacgrab uninstall` removes them.
+
+```
+[pacgrab]
+SigLevel = Optional TrustAll
+Server = file:///home/YOU/pacgrab
+```
+
+## Install
+
+```sh
+git clone git@github.com:adior-enigmac/pacgrab.git
+cd pacgrab
+install -Dm755 pacgrab          ~/.local/bin/pacgrab
+install -Dm755 pacgrab-tui.sh   ~/.local/bin/pacgrab-tui.sh
+```
+
+Enable the local repo once (as root), then sync:
+
+```sh
+pacgrab repo   # prints the exact [pacgrab] block to paste into /etc/pacman.conf
+sudo pacman -Sy
+```
+
+## Usage
+
+```
+pacgrab -S <pkg> [...]    AUR replacement: grab the project's own download (else AUR)
+pacgrab <url>             install app from a link (GitHub release or direct download)
+pacgrab list              show managed packages and install status
+pacgrab recipe [p ...]    look inside recipes: one line each, or print full PKGBUILD(s)
+pacgrab build <p> [...]   rebuild + reinstall one or more packages
+pacgrab build-all         rebuild + reinstall everything
+pacgrab uninstall <name>  remove the app (recipe stays; add --purge to delete it too)
+pacgrab update <name>     bump + rebuild one GitHub package
+pacgrab update-all        bump + rebuild all outdated GitHub packages
+pacgrab check             show which GitHub packages have updates
+pacgrab sync [name ...]   install recipe desktops+icons directly, no rebuild
+pacgrab refresh <name>    regenerate recipe from its URL with current code
+pacgrab bump <p> [ver]    bump version: GitHub API or explicit version
+pacgrab edit <name>       open the PKGBUILD in $EDITOR
+pacgrab new <name> O/R    scaffold a recipe by hand from GitHub owner/repo
+pacgrab fix-conflicts     delete unowned files that would block pacgrab package installs
+pacgrab prune [--yes]     delete recipes for apps that are not installed
+pacgrab clean             delete build leftovers and partial downloads
+pacgrab repo              regenerate the local pacman repo database
+pacgrab timer-install     weekly autoupdates via a systemd timer
+pacgrab timer-remove      remove the autoupdate timer
+```
+
+Run `pacgrab help` for the same list. A bare URL short-circuits to install:
+
+```sh
+pacgrab https://github.com/owner/repo/releases/download/v1.2.3/app-linux-x86_64.tar.gz
+```
+
+### Autoupdates
+
+GitHub-backed recipes self-update. Either run `pacgrab update-all` yourself, or
+install a weekly systemd user timer:
+
+```sh
+pacgrab timer-install   # logs to ~/.local/share/pacgrab/update.log
+```
+
+### The TUI
+
+```sh
+pacgrab-tui.sh          # interactive menu (requires gum)
+pacgrab-tui.sh status   # plain-text status dump
+```
+
+## What it understands
+
+`pacgrab install` inspects the download and picks a packaging strategy
+automatically:
+
+| Layout            | Detected from                                   | Result                          |
+| ----------------- | ----------------------------------------------- | ------------------------------- |
+| Structured tree   | `bin/` + `share/`                               | binaries → `/usr/bin`, data → `/usr/share` |
+| AppImage          | `*.AppImage`                                     | → `/opt/<pkg>`, symlinked into `/usr/bin` |
+| Debian package    | `*.deb`                                          | repacked from `data.tar.*`      |
+| Opt tree          | launcher script / app binary deep in the tree    | whole tree → `/opt`             |
+| Raw binary        | a bare ELF with no archive                       | straight to `/usr/bin`          |
+| Cursor/icon theme | `index.theme`/`cursor.theme` + `cursors/`       | → `/usr/share/icons`            |
+
+It also detects a `.desktop` and icon (falling back to the repo's own assets),
+and probes whether the app is terminal vs GUI so the generated `.desktop` sets
+`Terminal=` correctly.
+
+## Requirements
+
+- Arch Linux with `pacman` + `makepkg` (`base-devel`)
+- `curl`, `bsdtar`; `jq` for `-S`; `gum` for the TUI
+- an AUR helper (`paru`/`yay`) only if you want the `-S` AUR fallback
+
+## Notes
+
+- The repo section **must not** be named `local` — libalpm reserves that name for
+  the installed-packages database. `pacgrab` uses `[pacgrab]`.
+- GitHub links autoupdate; other links install fine but you bump them manually.
+
+## License
+
+MIT.

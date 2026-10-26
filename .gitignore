@@ -1,0 +1,17 @@
+# pacgrab tracks ONLY the tool itself.
+#
+# This directory is the tool's live BASE (~/pacgrab): it holds the scripts
+# plus every generated recipe, built package, downloaded source and repo
+# database. All of that is state the tool (re)creates, so it is ignored by
+# default and only the files explicitly whitelisted below are tracked.
+#
+# Whitelist approach: ignore everything, then re-include the tool.
+
+# ignore everything at every level
+*
+
+# --- tracked tool files ---
+!.gitignore
+!README.md
+!pacgrab
+!pacgrab-tui.sh
