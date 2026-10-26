@@ -518,6 +518,9 @@ cmd_repo() {
   done
   cd "$BASE"
   repo-add -q -R "$REPO_NAME.db.tar.gz" "${flat[@]}"
+  # DownloadUser (default alpm) fetches these over file:// - cover pkgs linked
+  # in from recipe dirs, which may have been built under a stricter umask
+  chmod o+rX "$BASE"/* 2>/dev/null || true
   echo "repo updated: ${#flat[@]} package(s). Add to /etc/pacman.conf:"
   echo "  [$REPO_NAME]"
   echo '  SigLevel = Optional TrustAll'
@@ -569,7 +572,7 @@ cmd_setup() {
   elif ! tar tzf "$dbfile" >/dev/null 2>&1; then
     echo "WARNING: $dbfile is not a valid db archive - 'pacman -Sy' will fail" >&2
   else
-    echo "db ok: $dbfile -> $(readlink -f "$dbfile") ($(stat -c%s "$dbfile" 2>/dev/null) bytes)"
+    echo "db ok: $dbfile -> $(readlink -f "$dbfile") ($(stat -Lc%s "$dbfile" 2>/dev/null) bytes)"
     echo "expect in pacman.conf:  Server = file://$BASE"
   fi
   # conf path overridable for testing / containers (default: system pacman.conf)
@@ -578,6 +581,42 @@ cmd_setup() {
     echo "note: $conf not found - add this section manually:"
     print_pacman_section
     return 0
+  fi
+  # pacman fetches repo files as DownloadUser (stock: alpm) inside a sandbox -
+  # archlinux.org news: "manual intervention for pacman 7.0.0 and local
+  # repositories required". $HOME defaults to 0700 (HOME_MODE), so that user
+  # cannot even reach $BASE: `pacman -Sy` dies with "pacgrab.db failed to
+  # download" while every check above, running as $USER, passes. Grant the
+  # download user traverse access along the path (ACL touches only that user;
+  # chmod o+x is the fallback) and make the served files world-readable -
+  # repo contents are public packages anyway. No DownloadUser line -> downloads
+  # run as the calling (root) user, nothing to do here.
+  local duser p mode f
+  duser=$(awk -F= '/^[[:space:]]*DownloadUser[[:space:]]*=/ {gsub(/[ \t\r]/,"",$2); print $2; exit}' "$conf" 2>/dev/null)
+  if [ -n "$duser" ]; then
+    p="$BASE"
+    while [ -n "$p" ] && [ "$p" != "/" ]; do
+      mode=$(stat -c %a "$p" 2>/dev/null)
+      if [[ ${mode:-} =~ ^[0-7]+$ ]] && (( (8#$mode & 1) == 0 )); then
+        # others lack +x on this path component - alpm cannot traverse it
+        if command -v setfacl >/dev/null 2>&1 && getent passwd "$duser" >/dev/null 2>&1 \
+            && setfacl -m "u:$duser:x" "$p" 2>/dev/null; then
+          echo "granted $duser traverse access to $p (pacman DownloadUser)"
+        elif chmod o+x "$p" 2>/dev/null; then
+          echo "chmod o+x $p (pacman DownloadUser=$duser must reach the repo)"
+        else
+          echo "WARNING: $duser cannot reach $p - 'pacman -Sy' will fail for [$REPO_NAME]:" >&2
+          echo "         sudo setfacl -m u:$duser:x '$p'    (or: sudo chmod o+x '$p')" >&2
+        fi
+      fi
+      p=$(dirname "$p")
+    done
+    # served files must be readable by the download user; a stricter umask
+    # would otherwise leave 0600 pkgs/db that pacman cannot fetch
+    for f in "$BASE"/*; do
+      [ -e "$f" ] || [ -L "$f" ] || continue
+      chmod o+rX "$f" 2>/dev/null || true
+    done
   fi
   if grep -q "^\[$REPO_NAME\]" "$conf" 2>/dev/null; then
     # present - but verify it points at THIS base. A stale/wrong Server path
