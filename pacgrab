@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # pacgrab - Gear Lever-like manager for local PKGBUILDs
 # Base: ~/pacgrab/<pkgname>/PKGBUILD
-# Usage: pacgrab <list|add|-S|check|clean|repo|setup|...> [args]
+# Usage: pacgrab <list|add|check|clean|repo|setup|...> [args]
 set -euo pipefail
 
 BASE="${AUR_LOCAL:-$HOME/pacgrab}"
@@ -21,7 +21,7 @@ need() { command -v "$1" >/dev/null || die "missing $1"; }
 # one just unpacks sources into /opt - there is no binary in it - so every
 # "is there anything to grab?" filter drops these first. A project that only
 # publishes sources (hyprland-git: its whole v0.56.2 release is
-# source-v0.56.2.tar.gz) then has nothing for pacgrab and stays on the AUR.
+# source-v0.56.2.tar.gz) then has nothing for pacgrab to package.
 # Matched as whole tokens (the "/" of a URL path counts as a boundary) so
 # "resource-1.0.zip" is NOT read as a source archive.
 SRC_ASSET_RE='(^|[-_./])(source|sources|src|orig|srpm|srcpkg|snapshot)([-_.]|$)|\.src\.rpm$'
@@ -48,10 +48,10 @@ pkg_info() { # $1=dir -> "pkgname(s) pkgver-pkgrel"
 }
 
 # Every recipe's metadata from ONE bash process. Doing this per recipe cost 19
-# `bash -c` spawns plus `grep|head|grep` for the origin check - over a second
-# of fork overhead under load - where one spawn covers the whole run (each
-# PKGBUILD is read with builtins, no greps). Prints one line per dir:
-#   "<dir>\t<pkgname(s) pkgver-pkgrel>\t<grab|aur>"
+# `bash -c` spawns plus `grep|head|grep` per recipe - over a second of fork
+# overhead under load - where one spawn covers the whole run (each PKGBUILD is
+# read with builtins, no greps). Prints one line per dir:
+#   "<dir>\t<pkgname(s) pkgver-pkgrel>"
 pkg_report() {
   [ $# -gt 0 ] || return 0
   bash -c 'for d do
@@ -63,18 +63,7 @@ pkg_report() {
               else
                 printf "%s %s-%s" "$pkgname" "$pkgver" "$pkgrel"
               fi ) || info="? ?"
-      # origin: pacgrab generated it - either _pacgrab_* vars anywhere in the
-      # file, or the generator header on the first line (AUR imports keep the
-      # AUR maintainer line instead)
-      origin=aur first="" line=""
-      IFS= read -r first < "$src" 2>/dev/null || first=""
-      case "$first" in *"@"localhost*) origin=grab ;; esac
-      if [ "$origin" = aur ]; then
-        while IFS= read -r line || [ -n "$line" ]; do
-          case "$line" in _pacgrab_*) origin=grab; break ;; esac
-        done < "$src"
-      fi
-      printf "%s\t%s\t%s\n" "${d%/}" "$info" "$origin"
+      printf "%s\t%s\n" "${d%/}" "$info"
     done' -- "$@"
 }
 
@@ -107,10 +96,10 @@ installed_cell() {
 }
 
 cmd_list() {
-  local rows=() base info pns pv p d _origin
+  local rows=() base info pns pv p d
   local -a all=()
   # one process for every PKGBUILD instead of one `bash -c` + `basename` per recipe
-  while IFS=$'\t' read -r d info _origin; do
+  while IFS=$'\t' read -r d info; do
     [ -n "$d" ] || continue
     base=${d##*/}
     pv=${info##* }; pns=${info% *}
@@ -520,7 +509,7 @@ cmd_clean() {
     [ -d "$d" ] || continue
     rm -rf "$d/src" "$d/pkg"
   done
-  rm -rf "${TMPDIR:-/tmp}"/pacgrab-add* "${TMPDIR:-/tmp}"/aur-migrate
+  rm -rf "${TMPDIR:-/tmp}"/pacgrab-add*
   rm -f "${SRCDEST:-${XDG_CACHE_HOME:-$HOME/.cache}/makepkg/src}"/*.part
   echo "cleaned pacgrab dirs + /tmp. Cache kept at $PKGDEST_DIR ($(du -sh "$PKGDEST_DIR" 2>/dev/null | cut -f1))."
 }
@@ -1237,233 +1226,12 @@ cmd_fix_conflicts() { # remove unowned files that any pacgrab package would inst
   echo "fix-conflicts: removed $removed orphaned file(s)."
 }
 
-_restore_tty() { # after reading a prompt from a pipe, give stdin back to the
-  # terminal - otherwise the sudo in the next step has no tty to ask with
-  [ -t 0 ] && return 0
-  if { : </dev/tty; } 2>/dev/null; then exec 0</dev/tty; fi
-  return 0
-}
-
-yesno() { # $1=prompt -> 0 only on an explicit yes (EOF/non-tty = no)
-  # printf (not `read -p`): read -p hides the prompt unless stdin is a tty
-  printf '%s [y/N] ' "$1" >&2
-  local ans=""
-  if ! read -r ans; then _restore_tty; return 1; fi
-  _restore_tty
-  [[ "$ans" =~ ^[Yy]$ ]]
-}
-
-aur_helper() { command -v paru 2>/dev/null || command -v yay 2>/dev/null; }
-
-# $1=AUR PKGBUILD -> its source[]/source_x86_64[] entries, one per line.
-# Elements are already expanded: bash expands them when the array is assigned
-# during `source`, so no second eval is needed.
-aur_srcurls() {
-  bash -c 'source "$1" 2>/dev/null || exit 0
-    for s in ${source[@]+"${source[@]}"} ${source_x86_64[@]+"${source_x86_64[@]}"}; do
-      printf "%s\n" "${s##*::}"
-    done' _ "$1" 2>/dev/null
-}
-
-aur_fallback() { # $1=pkg: nothing grabbable -> ask before using the AUR helper
-  local pkg="$1" helper
-  # adopt/migrate mode: the package is already installed, so never prompt to
-  # reinstall it through an AUR helper - just leave it managed by the AUR
-  if [ "${PACGRAB_ADOPT:-0}" = 1 ]; then
-    echo "$pkg: no grabbable download - leaving the installed AUR package as-is"
-    return 1
-  fi
-  helper=$(aur_helper) || { echo "$pkg: no AUR helper (paru/yay) installed"; return 1; }
-  if yesno "$pkg: no grabbable download - install through the AUR with ${helper##*/}?"; then
-    wait_lock || return 1
-    "$helper" -S --noconfirm "$pkg"
-    return $?
-  fi
-  echo "$pkg: skipped (AUR fallback declined)"
-  return 1
-}
-
-# -S <pkg> [...] [--no-build] : AUR replacement. Find where the project itself
-# publishes downloads and build one of those into a pacgrab recipe; only hand
-# off to the AUR helper when the upstream has no normal download we can grab.
-cmd_S() {
-  need curl; need jq
-  local nobuild=0 fail=0 a pkg
-  local -a pkgs=()
-  for a in "$@"; do
-    case "$a" in
-      --no-build) nobuild=1 ;;
-      -*) die "unknown option: $a (usage: $0 -S <pkgname> [...] [--no-build])" ;;
-      *) pkgs+=("$a") ;;
-    esac
-  done
-  [ ${#pkgs[@]} -ge 1 ] || die "usage: $0 -S <pkgname> [...] [--no-build]"
-  for pkg in "${pkgs[@]}"; do
-    cmd_S_one "$pkg" "$nobuild" || fail=1
-  done
-  return $fail
-}
-
-cmd_S_one() { # $1=pkgname  $2=nobuild(0/1)
-  local pkg="$1" nobuild="${2:-0}"
-  local json base name aurl tmp npkgs cand pick ghurl
-  local -a addargs=()
-
-  # 1. already one of ours -> just (re)build it
-  if [ -f "$BASE/$pkg/PKGBUILD" ]; then
-    if [ "$nobuild" = 1 ]; then echo "$pkg: already a pacgrab recipe (build skipped)"; return 0; fi
-    echo "$pkg: already a pacgrab recipe, rebuilding"
-    cmd_build "$pkg"; return $?
-  fi
-
-  # 2. any sync repo (cachyos-*, core, extra, ...) belongs to pacman -
-  #    this only replaces the AUR. $REPO_NAME is pacgrab's own repo.
-  local -a sync_repos=()
-  mapfile -t sync_repos < <(pacman -Si "$pkg" 2>/dev/null | awk -F': *' '/^Repository/ {print $2}')
-  if [ ${#sync_repos[@]} -gt 0 ]; then
-    local r is_local=1
-    for r in "${sync_repos[@]}"; do [ "$r" != "$REPO_NAME" ] && is_local=0; done
-    if [ "$is_local" = 0 ]; then
-      echo "$pkg: official package (${sync_repos[*]}) - pacman manages it, not the AUR"
-      if yesno "$pkg: install from the official repos with pacman?"; then
-        wait_lock || return 1
-        sudo pacman -S --noconfirm "$pkg" || return 1
-      fi
-      return 0
-    fi
-    echo "$pkg: provided by the pacgrab [$REPO_NAME] repo (install with: sudo pacman -S $pkg)"
-    return 0
-  fi
-
-  # 3. the AUR only tells us where the project lives - never its payload
-  json=$(curl -fsSL -G --data-urlencode "arg[]=$pkg" "https://aur.archlinux.org/rpc/v5/info") \
-    || { echo "$pkg: AUR lookup failed"; return 1; }
-  jq -e '.resultcount > 0' >/dev/null <<<"$json" \
-    || { echo "$pkg: not in the official repos and not in the AUR"; return 1; }
-  base=$(jq -r '.results[0].PackageBase' <<<"$json")
-  name=$(jq -r '.results[0].Name' <<<"$json")
-  aurl=$(jq -r '.results[0].URL' <<<"$json")
-  echo "$pkg: in the AUR as $base (upstream: ${aurl:-unknown})"
-  # 1 if this recipe dir isn't there yet, so a failed grab can undo itself
-  local made_dir=1; [ -e "$BASE/$name" ] && made_dir=0
-
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/pacgrab-S-XXXXXX")
-  if ! curl -fsSL "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h=$base" -o "$tmp/PKGBUILD"; then
-    rm -rf "$tmp"; echo "$pkg: cannot fetch the AUR PKGBUILD for $base"; return 1
-  fi
-
-  # split packages don't fit a single-package recipe
-  npkgs=$(bash -c 'source "$1" 2>/dev/null || { echo 0; exit 0; }
-    if declare -p pkgname 2>/dev/null | grep -q "declare -a"; then echo "${#pkgname[@]}"; else echo 1; fi' _ "$tmp/PKGBUILD")
-  if [ "${npkgs:-0}" -gt 1 ] 2>/dev/null; then
-    rm -rf "$tmp"
-    echo "$pkg: split AUR package ($npkgs pkgs in one PKGBUILD) - needs the AUR"
-    aur_fallback "$pkg"; return $?
-  fi
-
-  # 4. a real, prebuilt download from the project itself?
-  cand=$(aur_srcurls "$tmp/PKGBUILD")
-  pick=$(printf '%s\n' "$cand" | grep -iP '^https?://' \
-    | grep -viP '\.git($|\?)|git\+|/(archive|tarball|zipball)/|/tags/|pypi\.|pythonhosted|crates\.io|\.patch($|\?)|\.diff($|\?)|\.hook($|\?)|\.install($|\?)|\.sig($|\?)|\.asc($|\?)' \
-    | grep -iP 'releases?/|x86_64|amd64|aarch64|arm64|linux|appimage|\.deb$' \
-    | grep -iP '\.(AppImage|deb|tgz|tar\.(gz|xz|bz2|zst|lzma)|zip|7z|run|zst|xz|bz2)$' \
-    | grep -viP '\.pkg\.(tar\.)?(zst|xz|gz|bz2)$|'"$SRC_ASSET_RE" | head -1 || true)
-  if [ -z "$pick" ] && printf '%s\n' "$cand" | grep -qiP '\.pkg\.(tar\.)?(zst|xz|gz|bz2)$'; then
-    echo "$pkg: upstream ships only a prebuilt Arch package - not recipe-able"
-  fi
-  rm -rf "$tmp"
-
-  if [ -n "$pick" ]; then
-    echo "$pkg: grabbing the project's own download: $pick"
-    addargs=("$pick" "$name"); [ "$nobuild" = 1 ] && addargs+=(--no-build)
-    if ( cmd_add "${addargs[@]}" ); then return 0; fi
-    echo "$pkg: could not make a recipe from that URL"
-    if [ "$made_dir" = 1 ]; then rm -rf "$BASE/$name"; fi
-    aur_fallback "$pkg"; return $?
-  fi
-
-  # 5. AUR source is only a checkout? try the project's GitHub releases.
-  #    Look at the real source (git+/archive URLs), not just the homepage,
-  #    and only if the release ships something that looks like an app -
-  #    some projects' "releases" are just images or source snapshots.
-  local repo_hint="$aurl" rel assets appassets
-  if printf '%s\n' "$cand" | grep -qiP 'github\.com'; then
-    repo_hint=$(printf '%s\n' "$cand" | grep -iP 'github\.com' | head -1)
-  fi
-  if [[ "$repo_hint" =~ github\.com[:/]([^/]+/[^/?#]+) ]]; then
-    ghurl="${BASH_REMATCH[1]}"; ghurl="${ghurl%.git}"
-    rel=$(curl -fsSL --max-time 20 "https://api.github.com/repos/$ghurl/releases/latest" 2>/dev/null || true)
-    assets=$(printf '%s' "$rel" | jq -r '.assets[]?.name' 2>/dev/null || true)
-    # only assets that could be an app: a source snapshot matches the
-    # extension test below but is not a download, so it must not count
-    appassets=$(printf '%s\n' "$assets" | grep -viP "$SRC_ASSET_RE" || true)
-    if printf '%s\n' "$appassets" | grep -qiP '\.(AppImage|deb|tgz|tar\.(gz|xz|bz2|zst)|zip|7z|run|zst|xz)$|linux|x86_64|amd64|arm64'; then
-      echo "$pkg: AUR source is only a checkout - using github.com/$ghurl releases"
-      addargs=("https://github.com/$ghurl" "$name"); [ "$nobuild" = 1 ] && addargs+=(--no-build)
-      if ( cmd_add "${addargs[@]}" ); then return 0; fi
-      echo "$pkg: could not turn a GitHub release into a recipe"
-    elif [ -n "$assets" ]; then
-      echo "$pkg: github.com/$ghurl releases carry no app download ($(printf '%s' "$assets" | tr '\n' ' '))"
-    else
-      echo "$pkg: github.com/$ghurl publishes no release assets"
-    fi
-  fi
-
-  # 6. nothing we can grab -> the AUR (drop any half-made recipe first)
-  if [ "$made_dir" = 1 ]; then rm -rf "$BASE/$name"; fi
-  aur_fallback "$pkg"
-}
-
-# migrate : turn every installed AUR package into a pacgrab recipe. Walks
-# `pacman -Qm` (foreign = installed but not in any sync repo = the AUR ones)
-# and runs each through the same grabber as `-S`, in adopt mode: nothing is
-# rebuilt (they are already installed) and the AUR-helper fallback is skipped.
-cmd_migrate() {
-  need curl; need jq
-  local pkg ver row made=0 already=0 aur=0
-  # adopted packages are already installed - never prompt to reinstall via AUR
-  PACGRAB_ADOPT=1
-  export PACGRAB_ADOPT
-  local -a pkgs=()
-  # pacman -Qm: "<name> <version>" for every foreign (AUR) package
-  mapfile -t pkgs < <(pacman -Qm 2>/dev/null | awk '{print $1"\t"$2}')
-  if [ ${#pkgs[@]} -eq 0 ]; then
-    echo "no installed AUR packages found - nothing to migrate"
-    return 0
-  fi
-  echo "migrating ${#pkgs[@]} installed AUR package(s) into pacgrab recipes..."
-  echo
-  for row in "${pkgs[@]}"; do
-    pkg=${row%%$'\t'*}; ver=${row#*$'\t'}
-    [ -n "$pkg" ] || continue
-    # a recipe that already exists is left alone
-    if [ -f "$BASE/$pkg/PKGBUILD" ]; then
-      echo "$pkg: already a pacgrab recipe"; already=$((already+1)); continue
-    fi
-    if cmd_S_one "$pkg" 1 >/dev/null 2>&1; then
-      if [ -f "$BASE/$pkg/PKGBUILD" ]; then
-        echo "$pkg: migrated -> $BASE/$pkg"; made=$((made+1))
-      else
-        echo "$pkg: no recipe created (left on the AUR)"; aur=$((aur+1))
-      fi
-    else
-      echo "$pkg: could not migrate (left on the AUR)"; aur=$((aur+1))
-    fi
-  done
-  echo
-  echo "migrate: $made new recipe(s), $already already pacgrab, $aur left on the AUR"
-  if [ "$made" -gt 0 ]; then
-    echo "run 'pacgrab list' to see them"
-  fi
-  return 0
-}
-
 cmd_prune() { # remove recipe dirs for packages that are not installed
   local yes=0; [ "${1:-}" = "--yes" ] && yes=1
-  local dead=() d name pns p info row any _origin
+  local dead=() d name pns p info row any
   local -a all=() rows=()
   # one process for every PKGBUILD instead of `basename` + `bash -c` per recipe
-  while IFS=$'\t' read -r d info _origin; do
+  while IFS=$'\t' read -r d info; do
     [ -n "$d" ] || continue
     name=${d##*/}
     # pkg_report reports "? ?" when the PKGBUILD would not source (syntax error
@@ -1555,7 +1323,7 @@ cmd_sync() { # $@=names (default: all): install recipe desktops+icons directly, 
     targets=("$@")
   fi
   local fail=0 changed=0 name d desk base icon iconfile src url ext inst
-  local first want have info shipped names n f line _origin
+  local first want have info shipped names n f line
   local -A FIRST=() WANT=() NAMES=() DESK=()
   local -a firsts=() deskpaths=() dirs=()
   # resolve each recipe's package name(s), wanted version and desktop file in
@@ -1565,7 +1333,7 @@ cmd_sync() { # $@=names (default: all): install recipe desktops+icons directly, 
   for name in "${targets[@]}"; do
     if [ -f "$BASE/$name/PKGBUILD" ]; then dirs+=("$BASE/$name"); fi
   done
-  while IFS=$'\t' read -r d info _origin; do
+  while IFS=$'\t' read -r d info; do
     [ -n "$d" ] || continue
     name=${d##*/}
     names=${info% *}
@@ -1837,7 +1605,7 @@ cmd_timer_remove() {
 # recipe [pkg...] : look inside the recipes. No args = one line per recipe;
 # names given = print those PKGBUILDs in full.
 cmd_recipe() {
-  local d p info n total status names origin pkg fail=0 r
+  local d p info n total status names pkg fail=0 r
   local -a rows=() all=()
   if [ $# -eq 0 ]; then
     local found=0
@@ -1845,11 +1613,11 @@ cmd_recipe() {
     # (`bash -c` + grep/head/grep) - ~1s of spawns under load, ~50ms here.
     # Sourcing also resolves variables/split arrays (grep can't), and
     # `makepkg --printsrcinfo` does the same at 2.4s per recipe.
-    while IFS=$'\t' read -r d info origin; do
+    while IFS=$'\t' read -r d info; do
       [ -n "$d" ] || continue
       found=1
       names=${info% *}
-      rows+=("$d|$names|$origin")
+      rows+=("$d|$names")
       for n in $names; do all+=("$n"); done
     done < <(pkg_report "$BASE"/*/)
     [ "$found" = 1 ] || { echo "no recipes in $BASE"; return 0; }
@@ -1859,9 +1627,9 @@ cmd_recipe() {
     # %-26s/%-46s shifted every column as soon as one name grew past it
     # (skwd-suite-bin lists 4 package names), so nothing lined up after it
     local -a out=()
-    local w1=6 w2=9 w3=4 c1 c2 c3 c4 # headers: RECIPE PKGNAME(S) FROM
+    local w1=6 w2=9 c1 c2 c3 # headers: RECIPE PKGNAME(S)
     for r in "${rows[@]}"; do
-      d=${r%%|*}; r=${r#*|}; names=${r%%|*}; origin=${r#*|}
+      d=${r%%|*}; r=${r#*|}; names=$r
       if [[ "$names" == *" "* ]]; then
         n=0; total=0
         for p in $names; do
@@ -1877,13 +1645,12 @@ cmd_recipe() {
       c1="${d##*/}"; c2="${names% }"
       [ ${#c1} -gt "$w1" ] && w1=${#c1}
       [ ${#c2} -gt "$w2" ] && w2=${#c2}
-      [ ${#origin} -gt "$w3" ] && w3=${#origin}
-      out+=("$c1|$c2|$origin|$status")
+      out+=("$c1|$c2|$status")
     done
-    printf "%-${w1}s %-${w2}s %-${w3}s %s\n" "RECIPE" "PKGNAME(S)" "FROM" "STATUS"
+    printf "%-${w1}s %-${w2}s %s\n" "RECIPE" "PKGNAME(S)" "STATUS"
     for r in "${out[@]}"; do
-      c1=${r%%|*}; r=${r#*|}; c2=${r%%|*}; r=${r#*|}; c3=${r%%|*}; c4=${r#*|}
-      printf "%-${w1}s %-${w2}s %-${w3}s %s\n" "$c1" "$c2" "$c3" "$c4"
+      c1=${r%%|*}; r=${r#*|}; c2=${r%%|*}; c3=${r#*|}
+      printf "%-${w1}s %-${w2}s %s\n" "$c1" "$c2" "$c3"
     done
     return 0
   fi
@@ -1901,13 +1668,11 @@ cmd_help() {
   echo "pacgrab - paste a URL, get the app (~/pacgrab)"
   echo
   local cmds=(
-    "-S <pkg> [...]|AUR replacement: grab the project's own download (else AUR)"
     "<url>|install app from a link (GitHub release or direct download)"
     "list|show managed packages and install status"
     "recipe [p ...]|look inside recipes: one line each, or print full PKGBUILD(s)"
     "sync [name ...]|install recipe desktops+icons directly, no rebuild"
     "refresh <name>|regenerate recipe from its URL with current code"
-    "migrate|make pacgrab recipes from every installed AUR package"
     "fix-conflicts|delete unowned files that would block pacgrab package installs"
     "prune [--yes]|delete recipes for apps that are not installed"
     "check|show which GitHub packages have updates"
@@ -1930,12 +1695,10 @@ case "${1:-help}" in
   list) cmd_list ;;
   recipe|recipes) shift; cmd_recipe "$@" ;;
   install|add) shift; cmd_add "$@" ;;
-  -S) shift; cmd_S "$@" ;;
   http*://*) cmd_add "$@" ;; # bare URL -> install
   bump) shift; cmd_bump "$@" ;;
   sync) shift; cmd_sync "$@" ;;
   refresh) shift; cmd_refresh "$@" ;;
-  migrate) cmd_migrate ;;
   fix-conflicts) cmd_fix_conflicts ;;
   prune) shift; cmd_prune "$@" ;;
   timer-run) # internal: what pacgrab-update.service executes

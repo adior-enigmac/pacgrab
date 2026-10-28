@@ -53,7 +53,6 @@ echo
 echo "done. next steps:"
 echo "  sudo pacman -Sy                     # sync so the [pacgrab] repo is known"
 echo "  pacgrab https://github.com/.../vX.Y.Z/app-linux-x86_64.tar.gz"
-echo "  pacgrab -S <pkg>                    # AUR replacement"
 echo "  pacgrab-tui.sh                      # interactive menu (needs gum)"
 case ":$PATH:" in
   *":$PREFIX:"*) ;;

@@ -4,20 +4,21 @@
 
 `pacgrab` turns a GitHub release URL (or any direct download link) into a proper
 local Arch package. It generates a PKGBUILD, builds it with `makepkg`, serves the
-result from a local pacman repository, and keeps it up to date — so GUI apps that
-normally live outside the official repos (or on the AUR) install, update, and
-uninstall like any other package.
+result from a local pacman repository, and keeps it up to date — so apps you
+install from a URL install, update, and uninstall like any other package.
 
 - **`pacgrab`** — the CLI (pure Bash, no runtime deps beyond `pacman`/`makepkg`).
 - **`pacgrab-tui.sh`** — an optional [gum](https://github.com/charmbracelet/gum)-based TUI front-end.
 
 ## Why
 
-Arch has `pacman` (official repos) and the AUR, but a lot of desktop apps are only
-published as a GitHub release tarball, an AppImage, a `.deb`, or a bare binary.
-`pacgrab` bridges that gap: it wraps any of those into a real package backed by a
-local repo, so you get version tracking, dependency handling, clean upgrades and
-uninstalls — without hand-writing a PKGBUILD or cluttering your AUR helper.
+Many desktop apps are only published as a GitHub release tarball, an AppImage,
+a `.deb`, or a bare binary — there is no Arch package for them. `pacgrab`
+bridges that gap: it wraps any of those into a real package backed by a local
+repo, so you get version tracking, dependency handling, clean upgrades and
+uninstalls — without hand-writing a PKGBUILD. It is just a local database of
+URL-fetched apps: every recipe lives in `~/pacgrab` and comes from a link you
+paste.
 
 ## How it works
 
@@ -37,7 +38,7 @@ Everything lives in a base directory (default `~/pacgrab`, override with
 
 `pacgrab repo` indexes the pool into a local database (`pacgrab.db`) that you add
 to `/etc/pacman.conf`. From then on the apps are ordinary packages: `pacman -Syu`
-upgrades them, `pacman -R` (or your AUR helper) removes them.
+upgrades them, `pacman -R` removes them.
 
 ```
 [pacgrab]
@@ -83,14 +84,12 @@ exact block to paste.
 ## Usage
 
 ```
-pacgrab -S <pkg> [...]    AUR replacement: grab the project's own download (else AUR)
 pacgrab <url>             install app from a link (GitHub release or direct download)
 pacgrab list              show managed packages and install status
 pacgrab recipe [p ...]    look inside recipes: one line each, or print full PKGBUILD(s)
 pacgrab check             show which GitHub packages have updates
 pacgrab sync [name ...]   install recipe desktops+icons directly, no rebuild
 pacgrab refresh <name>    regenerate recipe from its URL with current code
-pacgrab migrate           make recipes from every installed AUR package
 pacgrab bump <p> [ver]    bump version: GitHub API or explicit version
 pacgrab edit <name>       open the PKGBUILD in $EDITOR
 pacgrab new <name> O/R    scaffold a recipe by hand from GitHub owner/repo
@@ -173,8 +172,7 @@ Two things worth calling out:
 ## Requirements
 
 - Arch Linux with `pacman` + `makepkg` (`base-devel`)
-- `curl`, `bsdtar`; `jq` for `-S`; `gum` for the TUI
-- an AUR helper (`paru`/`yay`) only if you want the `-S` AUR fallback
+- `curl`, `bsdtar`; `gum` for the TUI
 
 ## Notes
 

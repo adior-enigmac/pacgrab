@@ -29,8 +29,7 @@ conf_state() {
 cmd_status() {
   echo "== pacgrab status =="
   echo "bases: $(find "$BASE" -maxdepth 2 -name PKGBUILD | wc -l)  repo: $(repo_state)  pacman.conf [$REPO_NAME]: $(conf_state)"
-  echo "foreign (AUR+local): $(pacman -Qm | wc -l)"
-  printf "%-24s %-12s %-30s\n" "BASE" "LAUR-VER" "INSTALLED"
+  printf "%-24s %-12s %-30s\n" "BASE" "VERSION" "INSTALLED"
   for d in "$BASE"/*/; do
     [ -f "$d/PKGBUILD" ] || continue
     base=$(basename "$d"); info=$(pkg_info "$d")
@@ -62,27 +61,16 @@ cmd_recipes() {
   fi
 }
 
-# `pacgrab -S` installs AUR-only packages and defers to pacman for official
-# ones - it prompts and may hand over to pacman, so it must NOT be piped into
-# gum pager (the prompt would go into the pager buffer instead of the terminal).
-cmd_aur() {
-  local pkg
-  pkg=$(gum input --prompt "aur> " --placeholder "AUR package name (pacgrab -S)") || return
-  [ -n "$pkg" ] || return
-  "$PACGRAB" -S "$pkg"
-}
-
 cmd_menu() {
   command -v gum >/dev/null || { echo "gum missing, falling back to status"; cmd_status; return; }
   while true; do
     gum style --foreground 5 --bold "pacgrab :: $(find "$BASE" -maxdepth 2 -name PKGBUILD | wc -l) pkgs · repo: $(repo_state) · [$REPO_NAME]: $(conf_state)"
     choice=$(gum choose --header "What to do?" \
-      "Status" "Recipes" "AUR install (-S)" "Install from URL" "Check GH updates" \
+      "Status" "Recipes" "Install from URL" "Check GH updates" \
       "Repo setup" "Clean artifacts" "View last log" "Quit") || break
     case "$choice" in
       Status) gum pager <<< "$(cmd_status)" ;;
       "Recipes") cmd_recipes ;;
-      "AUR install (-S)") cmd_aur ;;
       "Install from URL")
         url=$(gum input --placeholder "Paste GitHub release URL...") || continue
         [ -n "$url" ] && "$PACGRAB" install "$url" 2>&1 | gum pager ;;
