@@ -17,6 +17,15 @@ PG_RAW="${PACGRAB_RAW:-https://raw.githubusercontent.com/adior-enigmac/pacgrab/m
 die() { echo "error: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null || die "missing $1"; }
 
+# Release-asset names that are a source snapshot rather than an app. Packaging
+# one just unpacks sources into /opt - there is no binary in it - so every
+# "is there anything to grab?" filter drops these first. A project that only
+# publishes sources (hyprland-git: its whole v0.56.2 release is
+# source-v0.56.2.tar.gz) then has nothing for pacgrab and stays on the AUR.
+# Matched as whole tokens (the "/" of a URL path counts as a boundary) so
+# "resource-1.0.zip" is NOT read as a source archive.
+SRC_ASSET_RE='(^|[-_./])(source|sources|src|orig|srpm|srcpkg|snapshot)([-_.]|$)|\.src\.rpm$'
+
 wait_lock() { # wait up to $1 seconds (default 600) for the pacman db lock
   local timeout="${1:-600}" waited=0
   while [ -e /var/lib/pacman/db.lck ]; do
@@ -239,7 +248,7 @@ purge_conflicts() { # $1=recipe dir
 }
 
 cmd_build() { # $@=pkgnames
-  [ $# -ge 1 ] || die "usage: $0 build <pkgname> [...]"
+  [ $# -ge 1 ] || die "cmd_build: no package name given"
   need makepkg
   wait_lock || return 1
   local fail=0 name d p q
@@ -249,7 +258,12 @@ cmd_build() { # $@=pkgnames
     if [ ! -f "$d/PKGBUILD" ]; then echo "no PKGBUILD in $d, skipping"; fail=1; continue; fi
     echo "=== $name ==="
     ( cd "$d" && makepkg --printsrcinfo > .SRCINFO && makepkg -scf --noconfirm ) || { echo "FAILED: $name"; fail=1; continue; }
-    purge_conflicts "$d" || { echo "FAILED: $name (could not clear conflicts)"; fail=1; continue; }
+    # purging files that block the install needs sudo; a timer run has no TTY
+    # and must not delete anything on its own, so it is skipped there (the
+    # install step below is skipped too - both belong to the same install)
+    if [ "${PACGRAB_BUILD_ONLY:-0}" != 1 ]; then
+      purge_conflicts "$d" || { echo "FAILED: $name (could not clear conflicts)"; fail=1; continue; }
+    fi
     mapfile -t outpkgs < <(cd "$d" && makepkg --packagelist 2>/dev/null)
     if [ ${#outpkgs[@]} -eq 0 ]; then echo "FAILED: $name (no package produced)"; fail=1; continue; fi
     # PKGDEST may send artifacts to a cache dir - only install what exists
@@ -269,7 +283,16 @@ cmd_build() { # $@=pkgnames
         continue 2
       fi
     done
-    sudo pacman -U --noconfirm "${realpkgs[@]}" || { echo "FAILED: $name"; fail=1; continue; }
+    # a systemd --user oneshot has no TTY: `sudo pacman -U` there always dies
+    # with "a terminal is required to read the password" (verified in the
+    # journal), so the timer builds, publishes to the [pacgrab] repo via
+    # cmd_repo below, and prints what to run instead of failing on sudo
+    if [ "${PACGRAB_BUILD_ONLY:-0}" = 1 ]; then
+      echo "built (not installed): ${realpkgs[*]}"
+      echo "  install: sudo pacman -U ${realpkgs[*]}  (or: sudo pacman -Syu)"
+    else
+      sudo pacman -U --noconfirm "${realpkgs[@]}" || { echo "FAILED: $name"; fail=1; continue; }
+    fi
     cmd_repo >/dev/null || true
   done
   return $fail
@@ -341,6 +364,11 @@ cmd_bump() { # bump <pkg> [newver]: github via API, or explicit version for pinn
   if [ "$latest" = "$current" ]; then echo "$1 already at $current"; return 0; fi
   echo "$1: $current -> $latest"
   sed -i "s/^pkgver=.*/pkgver=$latest/; s/^pkgrel=.*/pkgrel=1/" "$d/PKGBUILD"
+  # same URL-ish swap as the explicit-version path: _pacgrab_url/source carry
+  # the version in their path, and skipping it left them on the previous tag
+  # while pkgver moved on (refresh then regenerated the OLD release)
+  local esc_cur; esc_cur=$(printf '%s' "$current" | sed 's/[][\.*^$]/\\&/g')
+  sed -i "/^\(source\|_pacgrab_url\|url\|pkgdesc\)=/s|$esc_cur|$latest|g" "$d/PKGBUILD"
   # subshell so the leaked `cd` can't move the script's cwd, and so a failed
   # updpkgsums is reported instead of leaving pkgver bumped with stale sums
   ( cd "$d" && updpkgsums && makepkg --printsrcinfo > .SRCINFO ) \
@@ -386,7 +414,7 @@ check_one() {
     # nothing to ask: a bare `return 0` here made check print only 8 of 20 lines,
     # so report what IS knowable - the recipe's own version - instead of silence
     if grep -q '^pkgver()' "$d/PKGBUILD" 2>/dev/null; then
-      echo "$name: VCS recipe (pkgver set at build, run: $0 build $name)"
+      echo "$name: VCS recipe (pkgver set when it is rebuilt)"
     else
       echo "$name: no version feed ($current)"
     fi
@@ -465,7 +493,7 @@ Exec=/usr/bin/$name
 Type=Application
 Categories=Utility;
 EOF
-  echo "created $d/PKGBUILD - edit source() then: $0 build $name"
+  echo "created $d/PKGBUILD - edit source() then: (cd $d && makepkg -sfi)"
 }
 
 PKGDEST_DIR="${PKGDEST:-${XDG_CACHE_HOME:-$HOME/.cache}/makepkg/pkg}"
@@ -685,9 +713,15 @@ cmd_add() {
     tag=$(printf '%s' "$json" | grep -oP '"tag_name":\s*"\K[^"]+' | head -1 || true)
     [ -n "$tag" ] || die "no releases for $gh"
     mapfile -t cands < <(printf '%s' "$json" | grep -oP '"browser_download_url":\s*"\K[^"]+')
-    aurl=$(printf '%s\n' "${cands[@]}" | grep -iP 'linux|x86_64|amd64|appimage|\.deb$' | grep -viP 'arm|aarch64|darwin|macos|windows|\.exe|source|\.rpm$' | grep -iP '\.tar\.gz$|\.tgz$|\.tar\.xz$|\.AppImage$|\.deb$|\.zip$' | head -1 || true)
-    [ -n "$aurl" ] || aurl=$(printf '%s\n' "${cands[@]}" | head -1)
-    [ -n "$aurl" ] || die "no downloadable asset in latest release"
+    aurl=$(printf '%s\n' "${cands[@]}" | grep -iP 'linux|x86_64|amd64|appimage|\.deb$' | grep -viP 'arm|aarch64|darwin|macos|windows|\.exe|\.rpm$|'"$SRC_ASSET_RE" | grep -iP '\.tar\.gz$|\.tgz$|\.tar\.xz$|\.AppImage$|\.deb$|\.zip$' | head -1 || true)
+    if [ -z "$aurl" ]; then
+      [ ${#cands[@]} -gt 0 ] || die "no downloadable asset in latest release"
+      # nothing arch-tagged: any asset can be it (projects that ship a plain
+      # "app-1.2.3.zip") - but never a source snapshot, that recipe would
+      # unpack sources into /opt instead of installing the app
+      aurl=$(printf '%s\n' "${cands[@]}" | grep -viP "$SRC_ASSET_RE" | head -1 || true)
+      [ -n "$aurl" ] || die "latest release only ships source snapshots: ${cands[*]}"
+    fi
     asset="${aurl##*/}"
     echo "picked: $asset ($tag)"
     ver="${tag#v}"; ver="${ver//-/_}"
@@ -1183,7 +1217,7 @@ EOF
   if [ "$nobuild" -eq 0 ]; then
     cmd_build "$name"
   else
-    echo "skipped build (--no-build). run: $0 build $name"
+    echo "skipped build (--no-build). build later: (cd $d && makepkg -sfi)"
   fi
 }
 
@@ -1333,7 +1367,7 @@ cmd_S_one() { # $1=pkgname  $2=nobuild(0/1)
     | grep -viP '\.git($|\?)|git\+|/(archive|tarball|zipball)/|/tags/|pypi\.|pythonhosted|crates\.io|\.patch($|\?)|\.diff($|\?)|\.hook($|\?)|\.install($|\?)|\.sig($|\?)|\.asc($|\?)' \
     | grep -iP 'releases?/|x86_64|amd64|aarch64|arm64|linux|appimage|\.deb$' \
     | grep -iP '\.(AppImage|deb|tgz|tar\.(gz|xz|bz2|zst|lzma)|zip|7z|run|zst|xz|bz2)$' \
-    | grep -viP '\.pkg\.(tar\.)?(zst|xz|gz|bz2)$' | head -1 || true)
+    | grep -viP '\.pkg\.(tar\.)?(zst|xz|gz|bz2)$|'"$SRC_ASSET_RE" | head -1 || true)
   if [ -z "$pick" ] && printf '%s\n' "$cand" | grep -qiP '\.pkg\.(tar\.)?(zst|xz|gz|bz2)$'; then
     echo "$pkg: upstream ships only a prebuilt Arch package - not recipe-able"
   fi
@@ -1352,7 +1386,7 @@ cmd_S_one() { # $1=pkgname  $2=nobuild(0/1)
   #    Look at the real source (git+/archive URLs), not just the homepage,
   #    and only if the release ships something that looks like an app -
   #    some projects' "releases" are just images or source snapshots.
-  local repo_hint="$aurl" rel assets
+  local repo_hint="$aurl" rel assets appassets
   if printf '%s\n' "$cand" | grep -qiP 'github\.com'; then
     repo_hint=$(printf '%s\n' "$cand" | grep -iP 'github\.com' | head -1)
   fi
@@ -1360,7 +1394,10 @@ cmd_S_one() { # $1=pkgname  $2=nobuild(0/1)
     ghurl="${BASH_REMATCH[1]}"; ghurl="${ghurl%.git}"
     rel=$(curl -fsSL --max-time 20 "https://api.github.com/repos/$ghurl/releases/latest" 2>/dev/null || true)
     assets=$(printf '%s' "$rel" | jq -r '.assets[]?.name' 2>/dev/null || true)
-    if printf '%s\n' "$assets" | grep -qiP '\.(AppImage|deb|tgz|tar\.(gz|xz|bz2|zst)|zip|7z|run|zst|xz)$|linux|x86_64|amd64|arm64'; then
+    # only assets that could be an app: a source snapshot matches the
+    # extension test below but is not a download, so it must not count
+    appassets=$(printf '%s\n' "$assets" | grep -viP "$SRC_ASSET_RE" || true)
+    if printf '%s\n' "$appassets" | grep -qiP '\.(AppImage|deb|tgz|tar\.(gz|xz|bz2|zst)|zip|7z|run|zst|xz)$|linux|x86_64|amd64|arm64'; then
       echo "$pkg: AUR source is only a checkout - using github.com/$ghurl releases"
       addargs=("https://github.com/$ghurl" "$name"); [ "$nobuild" = 1 ] && addargs+=(--no-build)
       if ( cmd_add "${addargs[@]}" ); then return 0; fi
@@ -1499,7 +1536,7 @@ cmd_refresh() { # refresh <name>: regenerate its PKGBUILD from the original URL 
      && bash -c 'source "$1/PKGBUILD" 2>/dev/null' _ "$d"; then
     trap - EXIT INT TERM
     # keep the installed version stamp if user hadn't bumped (regenerate keeps code, not version)
-    rm -rf "$bak"; echo "refreshed $1 (run: $0 build $1)"
+    rm -rf "$bak"; echo "refreshed $1 (rebuild with: cd $BASE/$1 && makepkg -sfi)"
   else
     trap - EXIT INT TERM
     rm -rf "$d"; mv "$bak" "$d"; die "refresh failed, restored backup"
@@ -1679,9 +1716,9 @@ cmd_update() { # update <pkg>: github via API; floating direct URLs via re-resol
     case "$u" in
       git+*|svn+*|hg+*|bzr+*)
         if grep -q '^pkgver()' "$d/PKGBUILD" 2>/dev/null; then
-          echo "$1: VCS recipe - pkgver set at build (run: $0 build $1)"
+          echo "$1: VCS recipe - pkgver set when it is rebuilt"
         else
-          echo "$1: VCS source pinned at $before (run: $0 edit $1, then build)"
+          echo "$1: VCS source pinned at $before ($0 edit $1 to change it, rebuild with makepkg -sfi)"
         fi
         return 0 ;;
     esac
@@ -1761,7 +1798,7 @@ cmd_self_update() { # fetch latest pacgrab + TUI into $BASE (best-effort: never 
   return 0 # best-effort: recipe updates must still run when offline
 }
 
-cmd_timer_install() { # install systemd user timer for weekly autoupdates
+cmd_timer_install() { # install systemd user timer for daily autoupdates
   local unitdir="$HOME/.config/systemd/user"
   mkdir -p "$unitdir" "$HOME/.local/share/pacgrab"
   cat > "$unitdir/pacgrab-update.service" <<EOF
@@ -1776,10 +1813,10 @@ StandardError=append:%h/.local/share/pacgrab/update.log
 EOF
   cat > "$unitdir/pacgrab-update.timer" <<EOF
 [Unit]
-Description=Weekly pacgrab autoupdate
+Description=Daily pacgrab autoupdate
 
 [Timer]
-OnCalendar=weekly
+OnCalendar=daily
 Persistent=true
 
 [Install]
@@ -1787,7 +1824,7 @@ WantedBy=timers.target
 EOF
   systemctl --user daemon-reload
   systemctl --user enable --now pacgrab-update.timer
-  echo "timer installed (weekly). log: ~/.local/share/pacgrab/update.log"
+  echo "timer installed (daily). log: ~/.local/share/pacgrab/update.log"
 }
 
 cmd_timer_remove() {
@@ -1818,7 +1855,11 @@ cmd_recipe() {
     [ "$found" = 1 ] || { echo "no recipes in $BASE"; return 0; }
     # one pacman call for every name in every recipe
     load_installed "${all[@]}"
-    printf '%-26s %-46s %-6s %s\n' "RECIPE" "PKGNAME(S)" "FROM" "STATUS"
+    # status first, then size the columns from the data: the old fixed
+    # %-26s/%-46s shifted every column as soon as one name grew past it
+    # (skwd-suite-bin lists 4 package names), so nothing lined up after it
+    local -a out=()
+    local w1=6 w2=9 w3=4 c1 c2 c3 c4 # headers: RECIPE PKGNAME(S) FROM
     for r in "${rows[@]}"; do
       d=${r%%|*}; r=${r#*|}; names=${r%%|*}; origin=${r#*|}
       if [[ "$names" == *" "* ]]; then
@@ -1833,7 +1874,16 @@ cmd_recipe() {
       else
         status="not installed"
       fi
-      printf '%-26s %-46s %-6s %s\n' "${d##*/}" "${names% }" "$origin" "$status"
+      c1="${d##*/}"; c2="${names% }"
+      [ ${#c1} -gt "$w1" ] && w1=${#c1}
+      [ ${#c2} -gt "$w2" ] && w2=${#c2}
+      [ ${#origin} -gt "$w3" ] && w3=${#origin}
+      out+=("$c1|$c2|$origin|$status")
+    done
+    printf "%-${w1}s %-${w2}s %-${w3}s %s\n" "RECIPE" "PKGNAME(S)" "FROM" "STATUS"
+    for r in "${out[@]}"; do
+      c1=${r%%|*}; r=${r#*|}; c2=${r%%|*}; r=${r#*|}; c3=${r%%|*}; c4=${r#*|}
+      printf "%-${w1}s %-${w2}s %-${w3}s %s\n" "$c1" "$c2" "$c3" "$c4"
     done
     return 0
   fi
@@ -1888,7 +1938,11 @@ case "${1:-help}" in
   migrate) cmd_migrate ;;
   fix-conflicts) cmd_fix_conflicts ;;
   prune) shift; cmd_prune "$@" ;;
-  timer-run) cmd_self_update; cmd_update_all ;; # internal: what pacgrab-update.service executes
+  timer-run) # internal: what pacgrab-update.service executes
+    # no TTY in a systemd --user oneshot, so no sudo: bump+build and report
+    # the install command instead of dying on `sudo pacman -U`
+    export PACGRAB_BUILD_ONLY=1
+    cmd_self_update; cmd_update_all ;;
   check) cmd_check ;;
   edit) shift; cmd_edit "$@" ;;
   new) shift; cmd_new "$@" ;;

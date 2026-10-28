@@ -8,7 +8,7 @@
 #   2. symlinks them into ~/.local/bin so they are on PATH
 #   3. runs `pacgrab setup`: seeds the local repo db and appends the [pacgrab]
 #      section to /etc/pacman.conf (idempotent; asks for sudo once)
-#   4. enables the weekly autoupdate timer: rebuilds outdated recipes and
+#   4. enables the daily autoupdate timer: rebuilds outdated recipes and
 #      updates pacgrab itself (best-effort; opt out with
 #      `systemctl --user disable --now pacgrab-update.timer`)
 #
@@ -45,7 +45,7 @@ echo "symlinked into $PREFIX"
 # seed the repo db + wire up /etc/pacman.conf
 "$BASE/pacgrab" setup
 
-# weekly autoupdates: enable the user timer (best-effort - needs a user systemd
+# daily autoupdates: enable the user timer (best-effort - needs a user systemd
 # session, which a normal login shell has; failure only means no auto-updates)
 "$BASE/pacgrab" timer-setup || echo "note: update timer not enabled - run: systemctl --user enable --now pacgrab-update.timer"
 
