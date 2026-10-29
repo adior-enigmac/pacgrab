@@ -246,7 +246,11 @@ cmd_build() { # $@=pkgnames
     d="$BASE/$name"
     if [ ! -f "$d/PKGBUILD" ]; then echo "no PKGBUILD in $d, skipping"; fail=1; continue; fi
     echo "=== $name ==="
-    ( cd "$d" && makepkg --printsrcinfo > .SRCINFO && makepkg -scf --noconfirm ) || { echo "FAILED: $name"; fail=1; continue; }
+    # makepkg honors an env SRCDEST over makepkg.conf (load_makepkg_config
+    # restores it), so point it at pacgrab's source cache - otherwise every
+    # build re-downloads what cmd_add already fetched (134 MB for Lunar).
+    local srcdest="${SRCDEST:-${XDG_CACHE_HOME:-$HOME/.cache}/makepkg/src}"
+    ( cd "$d" && SRCDEST="$srcdest" makepkg --printsrcinfo > .SRCINFO && SRCDEST="$srcdest" makepkg -scf --noconfirm ) || { echo "FAILED: $name"; fail=1; continue; }
     # purging files that block the install needs sudo; a timer run has no TTY
     # and must not delete anything on its own, so it is skipped there (the
     # install step below is skipped too - both belong to the same install)
@@ -814,9 +818,60 @@ cmd_add() {
   if [[ "$asset" == *.AppImage ]]; then
     kind="appimage"
     chmod +x "$tmp/$asset"
-    ( cd "$tmp" && "./$asset" --appimage-extract '*.desktop' '*.png' '*.svg' >/dev/null 2>&1 ) || true
-    desktop=$(find "$tmp/squashfs-root" -maxdepth 1 -name '*.desktop' -printf '%f\n' 2>/dev/null | head -1)
+    # old AppImage runtimes take exactly ONE prefix for --appimage-extract and
+    # print "Unexpected argument count" (no squashfs-root) when given several,
+    # e.g. Lunar Client 3.7.27. Feed them one pattern at a time and hoist each
+    # result out of squashfs-root before the next call (some runtimes wipe the
+    # dir first). If nothing lands (runtime without prefix support at all),
+    # fall back to a full extract so the desktop/icon are still found.
+    local pat
+    for pat in '*.desktop' '*.png' '*.svg'; do
+      ( cd "$tmp" && "./$asset" --appimage-extract "$pat" >/dev/null 2>&1 ) || true
+      if [ -d "$tmp/squashfs-root" ]; then
+        mkdir -p "$tmp/hoist"
+        cp -a "$tmp/squashfs-root/." "$tmp/hoist/" 2>/dev/null || true
+      fi
+    done
+    if [ -d "$tmp/hoist" ]; then
+      rm -rf "$tmp/squashfs-root" && mv "$tmp/hoist" "$tmp/squashfs-root" || true
+    else
+      ( cd "$tmp" && "./$asset" --appimage-extract >/dev/null 2>&1 ) || true
+    fi
+    # || true: find exits 1 when the extract produced no squashfs-root, and
+    # set -e + pipefail would otherwise kill the run silently right here.
+    desktop=$(find "$tmp/squashfs-root" -maxdepth 1 -name '*.desktop' -printf '%f\n' 2>/dev/null | head -1) || true
     binname="${desktop%.desktop}"; [ -z "$binname" ] && binname="$stem"
+    # ship the desktop's Icon= art: it lives at squashfs-root/<icon>.(png|svg)
+    # or .DirIcon (a symlink into the icon) - resolve it to a real file so the
+    # PKGBUILD can install it (see icon fallbacks further down).
+    # Order matters: Icon=lunarclient also matches a bare top-level
+    # "lunarclient" launcher file, so try art extensions before the bare name.
+    if [ -n "$desktop" ] && [ -z "$icon_rel" ]; then
+      local ientry ipath itarget
+      ientry=$(sed -n 's/^Icon=//p' "$tmp/squashfs-root/$desktop" 2>/dev/null | head -1 | tr -d '\r') || true
+      for ipath in "$tmp/squashfs-root/$ientry.png" "$tmp/squashfs-root/$ientry.svg" "$tmp/squashfs-root/$ientry" "$tmp/squashfs-root/.DirIcon"; do
+        if [ -f "$ipath" ]; then icon_rel="${ipath#$tmp/}"; break; fi
+        # dangling symlink (Lunar: lunarclient.png -> usr/share/.../lunarclient.png):
+        # the target sits deeper and the extract pattern's * does not cross '/',
+        # so pull the target in by its full path, then re-check.
+        if [ -L "$ipath" ]; then
+          itarget=$(readlink "$ipath") || true
+          if [ -n "$itarget" ] && [ "${itarget#/}" = "$itarget" ]; then
+            ( cd "$tmp" && "./$asset" --appimage-extract "$itarget" >/dev/null 2>&1 ) || true
+          fi
+          if [ -f "$ipath" ]; then icon_rel="${ipath#$tmp/}"; break; fi
+        fi
+      done || true
+    fi
+    # a symlinked icon must be recorded by its REAL path: package() re-extracts
+    # by that path, and a bare top-level symlink would dangle there again
+    # (Lunar: lunarclient.png -> usr/share/icons/hicolor/1024x1024/apps/...)
+    if [ -n "$icon_rel" ] && [ -L "$tmp/$icon_rel" ]; then
+      itarget=$(readlink -f "$tmp/$icon_rel") || true
+      case "$itarget" in
+        "$tmp/squashfs-root"/*) icon_rel="${itarget#$tmp/}" ;;
+      esac
+    fi
   elif [[ "$asset" == *.deb ]]; then
     kind="deb"
   else
@@ -919,6 +974,46 @@ cmd_add() {
         echo "repo icon: $pick"
       fi
     fi
+  fi
+  # AppImage icon: art found during inspection lives at squashfs-root/<file>.
+  # Re-extract it inside package() (one prefix per call for old runtimes),
+  # then install under the name the desktop's Icon= refers to.
+  if [ "$kind" = appimage ] && [ -n "$icon_rel" ]; then
+    # NOTE: not one `local a=.. b=$a ..` line - every word expands before
+    # local runs, so $ipat would still be unbound under `set -u`.
+    local ipat="${icon_rel#squashfs-root/}"
+    local ibase="${ipat##*/}" iext="${ipat##*.}" idest ibucket="" iw=""
+    # only real art counts: Icon=lunarclient may also match a bare top-level
+    # "lunarclient" binary, and a .DirIcon symlink dangles after extraction
+    case "$ipat" in
+      *.png|*.svg|*.xpm)
+        if [ "${iext,,}" = svg ]; then
+          idest="usr/share/icons/hicolor/scalable/apps/$binname.svg"
+        else
+          # PNG etc.: pick the largest hicolor size <= the real pixel size
+          # (1024 is not a standard hicolor dir; index.theme skips it).
+          command -v file >/dev/null 2>&1 && iw=$(file -b "$tmp/$icon_rel" 2>/dev/null | grep -oP '\d+(?= x \d+)' | head -1) || true
+          local s
+          for s in 16 22 24 32 48 64 96 128 256 512; do
+            [ -n "$iw" ] && [ "$s" -le "$iw" ] && ibucket="${s}x${s}" || true
+          done
+          if [ -n "$ibucket" ]; then
+            idest="usr/share/icons/hicolor/$ibucket/apps/$binname.$iext"
+          else
+            idest="usr/share/pixmaps/$binname.$iext"
+          fi
+        fi
+        # extract by FULL path first: the runtime's pattern * does not cross
+        # '/', so a basename would only match top-level art; fall back to the
+        # basename for icons that really sit at the root of the squashfs.
+        iconinst="  ./\"$asset\" --appimage-extract '$ipat' >/dev/null 2>&1 || true
+  [ -f \"squashfs-root/$ipat\" ] || .\"$asset\" --appimage-extract '$ibase' >/dev/null 2>&1 || true
+  install -Dm644 \"squashfs-root/$ipat\" \"\$pkgdir/$idest\" 2>/dev/null || install -Dm644 \"squashfs-root/$ibase\" \"\$pkgdir/$idest\" 2>/dev/null || true
+  sed -i \"s|^Icon=.*|Icon=$binname|\" \"\$pkgdir/usr/share/applications/$binname.desktop\" 2>/dev/null || true"
+        echo "icon: $icon_rel -> $idest"
+        ;;
+      *) icon_rel="" ;;
+    esac
   fi
   local pageurl="https://github.com/$gh" prov="GitHub releases"
   if [ -z "$gh" ]; then
@@ -1042,6 +1137,9 @@ sha256sums=('$sum'$iconsum)
 
 package() {
   install -Dm755 "$asset" "\$pkgdir/opt/$name/$binname.AppImage"
+  # usr/bin does not exist yet: install -D only creates the /opt parents, so
+  # a bare ln -s here dies with "No such file or directory"
+  install -d "\$pkgdir/usr/bin"
   ln -s "/opt/$name/$binname.AppImage" "\$pkgdir/usr/bin/$binname"
   ./"$asset" --appimage-extract '*.desktop' >/dev/null 2>&1 || true
   install -Dm644 squashfs-root/*.desktop "\$pkgdir/usr/share/applications/$binname.desktop" 2>/dev/null || true
