@@ -1198,19 +1198,38 @@ package() {
   [ -n "\$member" ] || { echo "pacgrab: no data.tar* member in $asset" >&2; return 1; }
   bsdtar -xOf "$asset" "\$member" | bsdtar -x -C "\$pkgdir"
   [ -n "\$(ls -A "\$pkgdir" 2>/dev/null)" ] || { echo "pacgrab: $asset unpacked to nothing" >&2; return 1; }
-  # jpackage debs (ink-music 2.0.2) keep their .desktop under /opt/<app>/lib and
-  # register it from postinst via xdg-desktop-menu, which pacman never runs: the
-  # app installs but is invisible to rofi/menus and has no /usr/bin launcher.
-  local desk exe
+  # debs register their desktop entry, /usr/bin launcher and icon from postinst
+  # (xdg-desktop-menu, ln -sf), which pacman never runs - the app installs but
+  # is invisible to rofi/menus. Replay that here.
+  local desk exe esc icon sz w1 w2 w3 w4 h1 h2 h3 h4
   if ! ls "\$pkgdir"/usr/share/applications/*.desktop >/dev/null 2>&1; then
+    # jpackage (ink-music 2.0.2): the desktop lives under /opt/<app>/lib
     desk=\$(find "\$pkgdir/opt" -name '*.desktop' -not -path '*/runtime/*' 2>/dev/null | head -1 || true)
-    if [ -n "\$desk" ]; then
-      install -Dm644 "\$desk" "\$pkgdir/usr/share/applications/$binname.desktop"
-      exe=\$(sed -n 's/^Exec=//p' "\$desk" | head -1 | sed -E 's/^"([^"]*)".*/\\1/; t; s/ .*//')
-      if [ -n "\$exe" ] && [ -x "\$pkgdir\$exe" ] && [ ! -e "\$pkgdir/usr/bin/$binname" ]; then
-        install -d "\$pkgdir/usr/bin"
-        ln -s "\$exe" "\$pkgdir/usr/bin/$binname"
-        sed -i "s|^Exec=.*|Exec=/usr/bin/$binname|" "\$pkgdir/usr/share/applications/$binname.desktop"
+    [ -n "\$desk" ] && install -Dm644 "\$desk" "\$pkgdir/usr/share/applications/$binname.desktop"
+  fi
+  desk=\$(ls "\$pkgdir"/usr/share/applications/*.desktop 2>/dev/null | head -1 || true)
+  if [ -n "\$desk" ] && ! ls "\$pkgdir"/usr/bin/* >/dev/null 2>&1; then
+    # electron-builder debs ship a desktop but \`ln -sf /opt/App/app /usr/bin/app\` in postinst
+    exe=\$(sed -n 's/^Exec=//p' "\$desk" | head -1 | sed -E 's/^"([^"]*)".*/\\1/; t; s/ .*//')
+    if [[ "\$exe" == /opt/* ]] && [ -x "\$pkgdir\$exe" ]; then
+      install -d "\$pkgdir/usr/bin"
+      ln -s "\$exe" "\$pkgdir/usr/bin/$binname"
+      # swap only the program: %U/%F must survive or opening files/URLs breaks
+      esc=\$(printf '%s' "\$exe" | sed 's/[][\\.*^\$+?(){}|#]/\\\\&/g')
+      sed -i -E "s#^(Exec=)(\\"\$esc\\"|\$esc)( |\\\$)#\\1/usr/bin/$binname\\3#" "\$desk"
+    fi
+  fi
+  if [ -n "\$desk" ]; then
+    # Icon=/opt/.../x.png bypasses the icon theme; ship it in hicolor instead
+    icon=\$(sed -n 's/^Icon=//p' "\$desk" | head -1)
+    if [[ "\$icon" == /opt/*.png ]] && [ -f "\$pkgdir\$icon" ]; then
+      # size from the IHDR chunk: \`file\` prints nothing under makepkg's fakeroot
+      read -r w1 w2 w3 w4 h1 h2 h3 h4 < <(od -An -tu1 -j16 -N8 "\$pkgdir\$icon") || true
+      sz=\$(( (\${w1:-0}<<24) | (\${w2:-0}<<16) | (\${w3:-0}<<8) | \${w4:-0} ))
+      if [ "\$(head -c4 "\$pkgdir\$icon" | tail -c3)" = PNG ] && [ "\$sz" -gt 0 ] \\
+         && [ "\$sz" -eq \$(( (\${h1:-0}<<24) | (\${h2:-0}<<16) | (\${h3:-0}<<8) | \${h4:-0} )) ]; then
+        install -Dm644 "\$pkgdir\$icon" "\$pkgdir/usr/share/icons/hicolor/\${sz}x\${sz}/apps/$binname.png"
+        sed -i "s|^Icon=.*|Icon=$binname|" "\$desk"
       fi
     fi
   fi
