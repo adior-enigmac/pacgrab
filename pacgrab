@@ -814,6 +814,7 @@ cmd_add() {
   echo "inspecting..."
   local listing="$tmp/listing.txt"
   local kind="unknown" top="" binname="" binpath="" desktop="" icon_rel="" icon_full=""
+  local -a debdeps=()
   : > "$listing" # deb/appimage list no archive, but the greps below still run
   if [[ "$asset" == *.AppImage ]]; then
     kind="appimage"
@@ -874,6 +875,28 @@ cmd_add() {
     fi
   elif [[ "$asset" == *.deb ]]; then
     kind="deb"
+    # map the deb's Depends: onto Arch packages for libs dlopen'd at runtime
+    # (ink-music needs libmpv via JNA; ldd can't see it, so nothing pulled mpv).
+    # Base libs (libc6, libx11-6, ...) are left out: Arch always has them.
+    local ctl dep
+    ctl=$(bsdtar -tf "$tmp/$asset" | grep -m1 '^control\.tar' || true)
+    if [ -n "$ctl" ]; then
+      while read -r dep; do
+        case "$dep" in
+          libmpv*) debdeps+=(mpv) ;;
+          libasound*) debdeps+=(alsa-lib) ;;
+          xdg-utils) debdeps+=(xdg-utils) ;;
+          libgtk-3*) debdeps+=(gtk3) ;;
+          libnss3*) debdeps+=(nss) ;;
+          libsecret*) debdeps+=(libsecret) ;;
+          libnotify*) debdeps+=(libnotify) ;;
+          libwebkit2gtk-4.1*) debdeps+=(webkit2gtk-4.1) ;;
+          libappindicator3*|libayatana-appindicator3*) debdeps+=(libayatana-appindicator) ;;
+        esac
+      done < <(bsdtar -xOf "$tmp/$asset" "$ctl" | bsdtar -xOf - ./control control 2>/dev/null \
+        | sed -n 's/^Depends: *//p' | tr ',|' '\n\n' | sed -E 's/\(.*\)//; s/^ +| +$//g' | sort -u)
+      [ ${#debdeps[@]} -gt 0 ] && mapfile -t debdeps < <(printf '%s\n' "${debdeps[@]}" | sort -u)
+    fi
   else
     if ! bsdtar -tf "$tmp/$asset" > "$listing" 2>/dev/null; then
       if [ "$(head -c 4 "$tmp/$asset")" = "$(printf '\177ELF')" ]; then
@@ -1158,7 +1181,7 @@ pkgdesc="$binname local build ($prov) (deb repack)"
 arch=('x86_64')
 url="$pageurl"
 license=($lic)
-depends=('hicolor-icon-theme')
+depends=('hicolor-icon-theme'$(printf " '%s'" "${debdeps[@]}" | sed "s/ ''//"))
 options=('!strip')
 _github="$gh"
 _pacgrab_url="$aurl"
@@ -1175,6 +1198,22 @@ package() {
   [ -n "\$member" ] || { echo "pacgrab: no data.tar* member in $asset" >&2; return 1; }
   bsdtar -xOf "$asset" "\$member" | bsdtar -x -C "\$pkgdir"
   [ -n "\$(ls -A "\$pkgdir" 2>/dev/null)" ] || { echo "pacgrab: $asset unpacked to nothing" >&2; return 1; }
+  # jpackage debs (ink-music 2.0.2) keep their .desktop under /opt/<app>/lib and
+  # register it from postinst via xdg-desktop-menu, which pacman never runs: the
+  # app installs but is invisible to rofi/menus and has no /usr/bin launcher.
+  local desk exe
+  if ! ls "\$pkgdir"/usr/share/applications/*.desktop >/dev/null 2>&1; then
+    desk=\$(find "\$pkgdir/opt" -name '*.desktop' -not -path '*/runtime/*' 2>/dev/null | head -1 || true)
+    if [ -n "\$desk" ]; then
+      install -Dm644 "\$desk" "\$pkgdir/usr/share/applications/$binname.desktop"
+      exe=\$(sed -n 's/^Exec=//p' "\$desk" | head -1 | sed -E 's/^"([^"]*)".*/\\1/; t; s/ .*//')
+      if [ -n "\$exe" ] && [ -x "\$pkgdir\$exe" ] && [ ! -e "\$pkgdir/usr/bin/$binname" ]; then
+        install -d "\$pkgdir/usr/bin"
+        ln -s "\$exe" "\$pkgdir/usr/bin/$binname"
+        sed -i "s|^Exec=.*|Exec=/usr/bin/$binname|" "\$pkgdir/usr/share/applications/$binname.desktop"
+      fi
+    fi
+  fi
 $iconinst
 }
 EOF
