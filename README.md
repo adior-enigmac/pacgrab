@@ -87,6 +87,7 @@ exact block to paste.
 pacgrab <url>             install app from a link (GitHub release or direct download)
 pacgrab list              show managed packages and install status
 pacgrab recipe [p ...]    look inside recipes: one line each, or print full PKGBUILD(s)
+pacgrab build <name ...>  build and install one or more managed packages
 pacgrab check             show which GitHub packages have updates
 pacgrab sync [name ...]   install recipe desktops+icons directly, no rebuild
 pacgrab refresh <name>    regenerate recipe from its URL with current code

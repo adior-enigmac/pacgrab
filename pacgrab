@@ -1260,11 +1260,19 @@ package() {
   cp -a * "\$pkgdir/opt/$name/"
   # safety net: never symlink a non-executable (e.g. a D-Bus .service or .desktop
   # file) as the CLI launcher. Fall back to a real binary matching the app name.
-  _launch="\$binpath"
+  # Embed the path found while inspecting the archive. Escaping this as
+  # "\$binpath" leaves it empty at package time, where the generic fallback
+  # can pick an executable postinst.sh (Discord Canary's reloads AppArmor).
+  _launch="$binpath"
   if [ ! -f "\$_launch" ] || [ ! -x "\$_launch" ]; then
     _cand=\$(find . -maxdepth 3 -type f -executable \
              \\( -name "$binname" -o -name "$binname.bin" -o -name "$stem" \\) 2>/dev/null | head -1)
-    [ -z "\$_cand" ] && _cand=\$(find . -maxdepth 3 -type f -executable 2>/dev/null | head -1)
+    [ -z "\$_cand" ] && _cand=\$(find . -maxdepth 3 -type f -executable \
+             ! -iname 'postinst' ! -iname 'postinst.sh' \
+             ! -iname 'postinstall' ! -iname 'postinstall.sh' \
+             ! -iname 'preinst' ! -iname 'preinst.sh' \
+             ! -iname 'prerm' ! -iname 'prerm.sh' \
+             ! -iname 'postrm' ! -iname 'postrm.sh' 2>/dev/null | head -1)
     [ -n "\$_cand" ] && _launch="\${_cand#./}"
   fi
   ln -s "/opt/$name/\$_launch" "\$pkgdir/usr/bin/$binname"
@@ -1827,6 +1835,7 @@ cmd_help() {
     "<url>|install app from a link (GitHub release or direct download)"
     "list|show managed packages and install status"
     "recipe [p ...]|look inside recipes: one line each, or print full PKGBUILD(s)"
+    "build <name ...>|build and install one or more managed packages"
     "sync [name ...]|install recipe desktops+icons directly, no rebuild"
     "refresh <name>|regenerate recipe from its URL with current code"
     "fix-conflicts|delete unowned files that would block pacgrab package installs"
@@ -1850,6 +1859,7 @@ case "${1:-help}" in
   help|-h|--help) cmd_help ;;
   list) cmd_list ;;
   recipe|recipes) shift; cmd_recipe "$@" ;;
+  build) shift; cmd_build "$@" ;;
   install|add) shift; cmd_add "$@" ;;
   http*://*) cmd_add "$@" ;; # bare URL -> install
   bump) shift; cmd_bump "$@" ;;
