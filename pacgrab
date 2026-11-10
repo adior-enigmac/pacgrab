@@ -746,7 +746,7 @@ cmd_add() {
     [ -n "$eff" ] || eff="$aurl"
     local effbase="${eff%%\?*}"; effbase="${effbase##*/}"
     effbase=$(printf '%b' "${effbase//%/\\x}") # decode %20 etc.
-    if [[ "$effbase" =~ \.(tar\.gz|tgz|tar\.xz|tar\.bz2|zip|deb|AppImage|rpm)$ ]]; then
+    if [[ "$effbase" =~ \.(tar\.gz|tgz|tar\.xz|tar\.zst|tar\.bz2|zip|deb|AppImage|rpm)$ ]]; then
       asset="$effbase"
       ver=$(printf '%s' "$eff" | grep -oP '\d+\.\d+(\.\d+){0,3}' | head -1 || true)
       [ -n "$ver" ] || ver="1.0.0"
@@ -794,14 +794,49 @@ cmd_add() {
   ln -sf "$final" "$tmp/$asset" # inspect from tmp, source of truth stays in srcdest cache
 
   local stem="$asset" name
+  # a ready-made Arch package (TwinDesk 3.0.0 ships twindesk-bin-3.0.0-1-x86_64.pkg.tar.zst):
+  # its first member is .BUILDINFO, so the tarball heuristics below would `cd .BUILDINFO`
+  # and the name parser would read "-1-x86_64" as part of the name (twindesk-bin-1-bin).
+  # Take name/deps/license from its .PKGINFO and repack the payload as-is.
+  local pkginfo="" pi_name="" pi_desc="" pi_lic=""
+  local -a pi_deps=() pi_opt=() pi_prov=() pi_conf=() pi_repl=()
+  if [[ "$asset" =~ \.pkg\.tar(\.(zst|xz|gz|bz2|lz4|lzo|lrz|Z))?$ ]]; then
+    pkginfo=$(bsdtar -xOf "$tmp/$asset" .PKGINFO 2>/dev/null || true)
+    [ -n "$pkginfo" ] || die "$asset looks like an Arch package but has no .PKGINFO"
+    local k v
+    while IFS= read -r line; do
+      [[ "$line" == *" = "* ]] || continue
+      k=${line%% = *}; v=${line#* = }
+      case "$k" in
+        pkgname) pi_name="$v" ;;
+        pkgdesc) pi_desc="$v" ;;
+        license) pi_lic="${pi_lic:+$pi_lic }'$v'" ;;
+        depend) pi_deps+=("$v") ;;
+        optdepend) pi_opt+=("$v") ;;
+        provides) pi_prov+=("$v") ;;
+        conflict) pi_conf+=("$v") ;;
+        replaces) pi_repl+=("$v") ;;
+      esac
+    done <<< "$pkginfo"
+    [ -n "$pi_name" ] || die "$asset: .PKGINFO has no pkgname"
+    stem="${pi_name%-bin}"
+  else
   stem="${stem%.tar.gz}"; stem="${stem%.tgz}"; stem="${stem%.tar.xz}"; stem="${stem%.zip}"; stem="${stem%.deb}"; stem="${stem%.AppImage}"
   stem="${stem//-/_}"; stem="${stem//$ver/}" # remove version if embedded
   stem=$(printf '%s' "$stem" | sed -E 's/[-_]+(linux|x86_64|amd64|aarch64|arm64|unknown|musl|darwin|windows|apple|pc|static|gnu).*//I; s/[-_]+v$//I; s/[-_.]+$//; s/[-_[:space:]]+/-/g')
   stem=$(printf '%s' "$stem" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9@._+-]/-/g; s/-+/-/g')
+  fi
   [ -n "$stem" ] || stem="app"
   name="${force_name:-${stem}-bin}"
   local d="$BASE/$name"
-  if [ -e "$d" ]; then
+  # same app switching to an upstream .pkg.tar.* (twindesk-bin: deb repack 2.4.0 ->
+  # pkg 3.0.0): the old recipe can't fetch the new asset, so regenerate it instead
+  # of rebuilding the stale one. The old PKGBUILD is kept as PKGBUILD.prev.
+  if [ -n "$pkginfo" ] && [ -f "$d/PKGBUILD" ] && ! grep -q "^_pacgrab_url=\"$aurl\"\$" "$d/PKGBUILD"; then
+    echo "$d exists for a different asset - regenerating recipe (old one: PKGBUILD.prev)"
+    mv -f "$d/PKGBUILD" "$d/PKGBUILD.prev"
+    rm -f "$d"/*.desktop "$d"/*.install
+  elif [ -e "$d" ]; then
     if pacman -Q "$name" >/dev/null 2>&1; then
       die "$d exists and $name is installed (reinstall with: sudo pacman -S $name)"
     else
@@ -816,7 +851,12 @@ cmd_add() {
   local kind="unknown" top="" binname="" binpath="" desktop="" icon_rel="" icon_full=""
   local -a debdeps=()
   : > "$listing" # deb/appimage list no archive, but the greps below still run
-  if [[ "$asset" == *.AppImage ]]; then
+  if [ -n "$pkginfo" ]; then
+    kind="pacpkg"
+    bsdtar -tf "$tmp/$asset" > "$listing" 2>/dev/null || true
+    binname=$(grep -oP '^(\./)?usr/bin/\K[^/]+$' "$listing" | head -1 || true)
+    [ -n "$binname" ] || binname="$stem"
+  elif [[ "$asset" == *.AppImage ]]; then
     kind="appimage"
     chmod +x "$tmp/$asset"
     # old AppImage runtimes take exactly ONE prefix for --appimage-extract and
@@ -973,7 +1013,7 @@ cmd_add() {
   mkdir -p "$d"
   # repo icon fallback: asset ships none but _github repo has one (e.g. doc/topgrade.png)
   local iconsrc="" iconsum="" iconinst=""
-  if [ -z "$icon_rel" ] && [ -n "$gh" ] && [[ "$kind" != deb && "$kind" != appimage && "$kind" != cursortheme ]]; then
+  if [ -z "$icon_rel" ] && [ -n "$gh" ] && [[ "$kind" != deb && "$kind" != appimage && "$kind" != cursortheme && "$kind" != pacpkg ]]; then
     local tree pick
     tree=$(curl -fsSL "https://api.github.com/repos/$gh/git/trees/HEAD?recursive=1" 2>/dev/null | grep -oP '"path":\s*"\K[^"]+\.(png|svg)' || true)
     if [ -n "$tree" ]; then
@@ -1051,7 +1091,7 @@ cmd_add() {
   fi
   # .desktop handling (except deb/appimage which do their own)
   local desk_install=""
-  if [[ "$kind" != deb && "$kind" != appimage && "$kind" != cursortheme ]]; then
+  if [[ "$kind" != deb && "$kind" != appimage && "$kind" != cursortheme && "$kind" != pacpkg ]]; then
     local icon_entry="$binname"
     if [ -n "$icon_rel" ]; then
       if [[ "$icon_rel" == share/* ]]; then icon_entry="${icon_rel##*/}"; icon_entry="${icon_entry%.*}"
@@ -1115,6 +1155,48 @@ EOF
   fi
 
   case "$kind" in
+    pacpkg) # upstream-built Arch package -> repack its payload unchanged
+      local installline="" descq
+      q() { local s; for s in "$@"; do printf " '%s'" "${s//\'/\'\\\'\'}"; done; }
+      # pacman runs .INSTALL hooks from the package: carry them over
+      if grep -qx '\.INSTALL' "$listing"; then
+        bsdtar -xOf "$tmp/$asset" .INSTALL > "$d/$name.install"
+        installline="install=$name.install"
+      fi
+      descq=${pi_desc:-$binname local build ($prov)}
+      descq=${descq//\\/\\\\}; descq=${descq//\"/\\\"}; descq=${descq//\$/\\\$}; descq=${descq//\`/\\\`}
+      cat > "$d/PKGBUILD" <<EOF
+# Maintainer: $(whoami) <$(whoami)@localhost> (generated by pacgrab install)
+pkgname=$name
+pkgver=$ver
+pkgrel=1
+pkgdesc="$descq (pacgrab repack)"
+arch=('x86_64')
+url="$pageurl"
+license=(${pi_lic:-custom})
+depends=($(q "${pi_deps[@]}"))
+optdepends=($(q "${pi_opt[@]}"))
+provides=($(q "${pi_prov[@]}"))
+conflicts=($(q "${pi_conf[@]}"))
+replaces=($(q "${pi_repl[@]}"))
+$installline
+options=('!strip' '!debug')
+_github="$gh"
+_pacgrab_url="$aurl"
+_asset="${atmpl:-$asset}"
+source=("\$_asset::$srcurl")
+noextract=("\$_asset")
+sha256sums=('$sum')
+
+package() {
+  # payload only: pacman metadata is regenerated by makepkg
+  bsdtar -xpf "\$srcdir/\$_asset" -C "\$pkgdir" \\
+    --exclude .PKGINFO --exclude .MTREE --exclude .BUILDINFO \\
+    --exclude .INSTALL --exclude .CHANGELOG
+  [ -n "\$(ls -A "\$pkgdir" 2>/dev/null)" ] || { echo "pacgrab: \$_asset unpacked to nothing" >&2; return 1; }
+}
+EOF
+      ;;
     structured)
       cat > "$d/PKGBUILD" <<EOF
 # Maintainer: $(whoami) <$(whoami)@localhost> (generated by pacgrab install)
