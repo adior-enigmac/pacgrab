@@ -318,11 +318,152 @@ cmd_uninstall() { # uninstall <name> [--purge]: pacman -R it; source dir stays u
   cmd_repo >/dev/null 2>&1 || true
 }
 
-cmd_bump() { # bump <pkg> [newver]: github via API, or explicit version for pinned URLs
+# refresh_sums <dir>: regenerate sha256sums + .SRCINFO against pacgrab's shared
+# source cache (SRCDEST), so the bytes hashed here are the bytes `pacgrab build`
+# will verify. The cache key is the filename alone, which is constant for rolling
+# links and vendor paths with build ids - each entry carries a <file>.url sidecar
+# recording which URL produced it, and anything whose sidecar no longer matches
+# the recipe is dropped instead of being hashed as-is (stale bytes would be
+# written into sha256sums and rejected by makepkg at build time).
+refresh_sums() {
+  local d="$1" meta fname surl srcdest f want eff
+  meta=$(bash -c 'source "$1/PKGBUILD" 2>/dev/null || exit 1
+    set -- "${source[@]}"
+    [ $# -gt 0 ] || set -- "${source_x86_64[@]}"
+    [ $# -gt 0 ] || set -- "${source_any[@]}"
+    for s in "$@"; do
+      [ -n "$s" ] || continue
+      u="${s##*::}"; u=$(eval echo "\"$u\"")
+      case "$u" in *icon.png|*icon.svg) continue;; *://*) ;; *) continue;; esac
+      # the name half of "name::url" is what makepkg calls the file - it can
+      # differ from the URL basename (renames, $pkgver templates)
+      case "$s" in
+        *::*) f="${s%%::*}"; f=$(eval echo "\"$f\"") ;;
+        *) b="${u%%\?*}"; b="${b%%#*}"; f="${b##*/}" ;;
+      esac
+      printf "%s\t%s\n" "$f" "$u"
+      break
+    done' _ "$d") || return 1
+  fname=${meta%%$'\t'*}; surl=${meta#*$'\t'}
+  if [ -z "$fname" ] || [ -z "$surl" ]; then
+    # no resolvable http source (local files, odd hand-made recipe): plain refresh
+    ( cd "$d" && updpkgsums && makepkg --printsrcinfo > .SRCINFO ) || return 1
+    return 0
+  fi
+  srcdest="${SRCDEST:-${XDG_CACHE_HOME:-$HOME/.cache}/makepkg/src}"
+  mkdir -p "$srcdest"
+  f="$srcdest/$fname"
+  want="$surl"
+  # effective URL (redirects) is what cmd_add writes into the sidecar, so
+  # resolve it the same way or every bump would invalidate a valid cache entry
+  eff=$(curl -fsSIL --retry 3 --retry-all-errors --retry-delay 2 -o /dev/null \
+    -w '%{url_effective}' "$surl" 2>/dev/null || true)
+  if [ -n "$eff" ]; then want="$eff"; fi
+  if [ -f "$f" ] && { [ ! -f "$f.url" ] || [ "$(cat "$f.url")" != "$want" ]; }; then
+    echo "cached $fname is from a different URL - re-downloading"
+    rm -f "$f" "$f.part" "$f.url"
+  fi
+  # the recipe's own src/ copy carries no URL provenance - drop it so only the
+  # validated shared copy (or a fresh download) can end up in the sums
+  rm -f "$d/src/$fname" "$d/src/$fname.part" 2>/dev/null || true
+  ( cd "$d" && SRCDEST="$srcdest" updpkgsums && makepkg --printsrcinfo > .SRCINFO ) || return 1
+  if [ -f "$f" ]; then
+    printf '%s' "$want" > "$f.url" 2>/dev/null || true
+  fi
+}
+
+# bump_url <dir> <name> <new-url>: the "give pacgrab the new link" bump for
+# pinned/generic recipes. Their URLs carry per-release bits (build ids, hashes)
+# that a version sed cannot derive, so swap the whole link instead, take pkgver
+# from the link's path, refresh sums. Afterwards: pacgrab build <name>.
+bump_url() {
+  local d="$1" name="$2" newurl="$3"
+  need curl; need updpkgsums
+  local cur curver currel
+  cur=$( ( source "$d/PKGBUILD" 2>/dev/null && printf '%s\n%s' "$pkgver" "${pkgrel:-1}" ) ) \
+    || die "$d/PKGBUILD is not sourceable - fix it first"
+  curver=${cur%%$'\n'*}; currel=${cur#*$'\n'}
+  [[ "$currel" =~ ^[0-9]+$ ]] || currel=1
+  # current link: _pacgrab_url first (concrete even when source= is a $pkgver
+  # template), else the first non-icon source entry
+  local oldurl
+  oldurl=$(bash -c 'source "$1/PKGBUILD" 2>/dev/null || exit 1
+    [ -n "${_pacgrab_url:-}" ] && { echo "$_pacgrab_url"; exit 0; }
+    set -- "${source[@]}"
+    [ $# -gt 0 ] || set -- "${source_x86_64[@]}"
+    [ $# -gt 0 ] || set -- "${source_any[@]}"
+    for s in "$@"; do
+      [ -n "$s" ] || continue
+      u="${s##*::}"; u=$(eval echo "\"$u\"")
+      case "$u" in *icon.png|*icon.svg) continue;; *://*) echo "$u"; break;; esac
+    done' _ "$d") || die "cannot determine current URL for $name"
+  [ -n "$oldurl" ] || die "no downloadable source in $d/PKGBUILD"
+  # resolve redirects: a rolling "/latest" link carries the real version in its
+  # final path
+  local want="$newurl" eff
+  eff=$(curl -fsSIL --retry 3 --retry-all-errors --retry-delay 2 -o /dev/null \
+    -w '%{url_effective}' "$newurl" 2>/dev/null || true)
+  if [ -n "$eff" ]; then want="$eff"; fi
+  # version from the path only: grepping the whole URL turns a host like
+  # v1.2.example.com (or 127.0.0.1) into a bogus pkgver
+  local path="$want"
+  path="${path%%\?*}"; path="${path#*://}"; path="${path#*/}"
+  local newver
+  newver=$(printf '%s' "$path" | grep -oP '\d+\.\d+(\.\d+){0,3}' | head -1 || true)
+  local newrel
+  if [ -n "$newver" ] && [ "$(norm_ver "$newver")" != "$(norm_ver "$curver")" ]; then
+    newrel=1
+  else
+    # no version in the link, or the same version re-released (new build id):
+    # keep pkgver and step pkgrel so pacman still sees an upgrade
+    newver="$curver"; newrel=$((currel + 1))
+  fi
+  echo "$name: $curver-$currel -> $newver-$newrel"
+  # rewrite on a temp copy - a failed swap must not leave the recipe half-bumped
+  local tmp="$d/.PKGBUILD.bump"
+  cp -p "$d/PKGBUILD" "$tmp" || die "bump failed: cannot write $tmp"
+  local esc_old esc_new
+  esc_old=$(printf '%s' "$oldurl" | sed 's/[][\.*^$|]/\\&/g')
+  esc_new=$(printf '%s' "$newurl" | sed 's/[\\&|]/\\&/g')
+  sed -i "/^\(source\|_pacgrab_url\)=/s|$esc_old|$esc_new|g" "$tmp" \
+    || { rm -f "$tmp"; die "bump failed: cannot rewrite $d/PKGBUILD"; }
+  if [ "$newver" != "$curver" ]; then
+    sed -i "s/^pkgver=.*/pkgver=$newver/; s/^pkgrel=.*/pkgrel=$newrel/" "$tmp" \
+      || { rm -f "$tmp"; die "bump failed: cannot rewrite $d/PKGBUILD"; }
+    local esc_cur; esc_cur=$(printf '%s' "$curver" | sed 's/[][\.*^$]/\\&/g')
+    sed -i "/^\(url\|pkgdesc\)=/s|$esc_cur|$newver|g" "$tmp" \
+      || { rm -f "$tmp"; die "bump failed: cannot rewrite $d/PKGBUILD"; }
+    grep -q "^pkgver=$newver$" "$tmp" \
+      || { rm -f "$tmp"; die "bump failed: pkgver not written to $d/PKGBUILD"; }
+  else
+    sed -i "s/^pkgrel=.*/pkgrel=$newrel/" "$tmp" \
+      || { rm -f "$tmp"; die "bump failed: cannot rewrite $d/PKGBUILD"; }
+  fi
+  grep -qF -- "$newurl" "$tmp" || {
+    local gh; gh=$(grep -oP '^_github="\K[^"]+' "$tmp" || true); rm -f "$tmp"
+    if [ -n "$gh" ]; then
+      die "bump failed: $name is a GitHub recipe - bump by version: pacgrab bump $name <newver>"
+    fi
+    die "bump failed: old URL not found in $d/PKGBUILD - edit it manually"
+  }
+  mv -f "$tmp" "$d/PKGBUILD"
+  refresh_sums "$d" || die "bump failed: could not refresh checksums in $d"
+  echo "next: pacgrab build $name"
+}
+
+cmd_bump() { # bump <pkg> [new-version|new-url]: github via API, explicit version, or a fresh link
   local d gh latest current
+  # name first, URL second: a URL in slot 1 is install syntax, not bump
+  if [[ "${1:-}" =~ ^https?:// ]]; then
+    die "usage: $0 bump <pkgname> <new-url>  (the URL goes second)"
+  fi
   if [ $# -eq 2 ]; then
     d="$BASE/$1"; local newver="$2"
     [ -f "$d/PKGBUILD" ] || die "no PKGBUILD in $d"
+    if [[ "$newver" =~ ^https?:// ]]; then
+      bump_url "$d" "$1" "$newver"
+      return
+    fi
     # tight charset: this value is pasted into a sed replacement and into URL path
     # segments - '/' or '&' there would corrupt the PKGBUILD or abort sed mid-write
     [[ "$newver" =~ ^[0-9][0-9A-Za-z._+-]*$ ]] || die "invalid version '$newver' (letters, digits and ._+- only)"
@@ -339,11 +480,10 @@ cmd_bump() { # bump <pkg> [newver]: github via API, or explicit version for pinn
     sed -i "s/^pkgver=.*/pkgver=$newver/; s/^pkgrel=.*/pkgrel=1/" "$d/PKGBUILD"
     sed -i "/^\(source\|_pacgrab_url\|url\|pkgdesc\)=/s|$esc_cur|$newver|g" "$d/PKGBUILD"
     grep -q "^pkgver=$newver$" "$d/PKGBUILD" || die "bump failed: pkgver not written to $d/PKGBUILD"
-    ( cd "$d" && updpkgsums && makepkg --printsrcinfo > .SRCINFO ) \
-      || die "bump failed: could not refresh checksums in $d"
+    refresh_sums "$d" || die "bump failed: could not refresh checksums in $d"
     return 0
   fi
-  [ $# -eq 1 ] || die "usage: $0 bump <pkgname> [new-version]"
+  [ $# -eq 1 ] || die "usage: $0 bump <pkgname> [new-version | new-url]"
   d="$BASE/$1"
   [ -f "$d/PKGBUILD" ] || die "no PKGBUILD in $d"
   need curl; need updpkgsums
@@ -364,8 +504,7 @@ cmd_bump() { # bump <pkg> [newver]: github via API, or explicit version for pinn
   sed -i "/^\(source\|_pacgrab_url\|url\|pkgdesc\)=/s|$esc_cur|$latest|g" "$d/PKGBUILD"
   # subshell so the leaked `cd` can't move the script's cwd, and so a failed
   # updpkgsums is reported instead of leaving pkgver bumped with stale sums
-  ( cd "$d" && updpkgsums && makepkg --printsrcinfo > .SRCINFO ) \
-    || die "bump failed: could not refresh checksums in $d"
+  refresh_sums "$d" || die "bump failed: could not refresh checksums in $d"
 }
 
 norm_ver() { printf '%s' "$1" | grep -oP '^\d+(\.\d+){0,3}' | awk -F. '{printf "%d.%d.%d", $1, $2+0, $3+0}'; }
@@ -422,7 +561,7 @@ check_one() {
   fi
   latest=$(printf '%s\n' "$body" | grep -oP "$cr" | head -1 || true)
   if [ -n "$latest" ] && [ "$(norm_ver "$latest")" != "$(norm_ver "$current")" ]; then
-    echo "$name: $current -> $latest available (re-pacgrab the new link)"
+    echo "$name: $current -> $latest available (update: pacgrab <new-url>)"
   else
     echo "$name: up to date ($current)"
   fi
@@ -723,7 +862,7 @@ cmd_add() {
     if [[ "$tag" == v* ]]; then srcurl="https://github.com/$gh/releases/download/v\$pkgver/$atmpl"
     else srcurl="https://github.com/$gh/releases/download/\$pkgver/$atmpl"; fi
   elif [[ "$url" =~ ^https?:// ]]; then
-    echo "generic URL (no GitHub autoupdate - bump manually with edit + build)"
+    echo "generic URL (no GitHub autoupdate - later: pacgrab <new-url>)"
     aurl="$url"
     asset="${aurl%%\?*}"; asset="${asset##*/}"
     [ -n "$asset" ] || die "cannot derive filename from URL"
@@ -836,14 +975,32 @@ cmd_add() {
     echo "$d exists for a different asset - regenerating recipe (old one: PKGBUILD.prev)"
     mv -f "$d/PKGBUILD" "$d/PKGBUILD.prev"
     rm -f "$d"/*.desktop "$d"/*.install
-  elif [ -e "$d" ]; then
-    if pacman -Q "$name" >/dev/null 2>&1; then
-      die "$d exists and $name is installed (reinstall with: sudo pacman -S $name)"
-    else
-      echo "$d exists but $name is not installed - building..."
-      cmd_build "$name"
+  elif [ -f "$d/PKGBUILD" ]; then
+    # existing recipe: check if the URL actually changed before bumping
+    local existing_url
+    existing_url=$(grep -oP '^_pacgrab_url="\K[^"]+' "$d/PKGBUILD" 2>/dev/null || true)
+    if [ -z "$existing_url" ]; then
+      # no _pacgrab_url: fall back to first non-icon source entry
+      existing_url=$(bash -c 'source "$1/PKGBUILD" 2>/dev/null || exit 1
+        set -- "${source[@]}"; [ $# -gt 0 ] || set -- "${source_x86_64[@]}"
+        for s in "$@"; do [ -n "$s" ] || continue
+          u="${s##*::}"; u=$(eval echo "\"$u\"")
+          case "$u" in *icon.png|*icon.svg) continue;; *://*) echo "$u"; break;; esac
+        done' _ "$d" || true)
+    fi
+    if [ "$existing_url" = "$aurl" ]; then
+      local curinfo; curinfo=$(pkg_info "$d")
+      echo "$name: already at this URL (${curinfo##* })"
+      rm -rf "$tmp"
       return 0
     fi
+    echo "$name: recipe exists, bumping with new URL..."
+    bump_url "$d" "$name" "$aurl"
+    cmd_build "$name"
+    rm -rf "$tmp"
+    return 0
+  elif [ -e "$d" ]; then
+    echo "$d exists but has no PKGBUILD - building from scratch..."
   fi
 
   echo "inspecting..."
@@ -1772,7 +1929,7 @@ cmd_update() { # update <pkg>: github via API; floating direct URLs via re-resol
         if grep -q '^pkgver()' "$d/PKGBUILD" 2>/dev/null; then
           echo "$1: VCS recipe - pkgver set when it is rebuilt"
         else
-          echo "$1: VCS source pinned at $before ($0 edit $1 to change it, rebuild with makepkg -sfi)"
+          echo "$1: VCS source pinned at $before (edit $BASE/$1/PKGBUILD to change it, rebuild with makepkg -sfi)"
         fi
         return 0 ;;
     esac
@@ -1783,13 +1940,13 @@ cmd_update() { # update <pkg>: github via API; floating direct URLs via re-resol
         cr=$(grep -oP '^_check_regex=\K.*' "$d/PKGBUILD" 2>/dev/null | sed "s/^'//; s/'$//" || true)
         latest=$(curl -fsSL --compressed --max-time 30 "$cu" 2>/dev/null | grep -oP "$cr" | head -1 || true)
         if [ -n "$latest" ] && [ "$(norm_ver "$latest")" != "$(norm_ver "$before")" ]; then
-          echo "$1: $before -> $latest available (re-pacgrab the new link)"
+          echo "$1: $before -> $latest available (update: pacgrab <new-url>)"
         else
           echo "$1 already latest ($before)"
         fi
         return 0
       fi
-      echo "$1: version-pinned URL - bump manually (pacgrab edit $1, or re-pacgrab the new link)"
+      echo "$1: version-pinned URL - update manually: pacgrab <new-url>"
       return 0
     fi
     cmd_refresh "$1" >/dev/null || { echo "$1: refresh failed (see error above)"; return 1; }
@@ -1806,7 +1963,7 @@ cmd_update() { # update <pkg>: github via API; floating direct URLs via re-resol
   # "already at"/"x -> y" too), errors still land on stderr via die()
   cmd_bump "$1" >/dev/null || { echo "$1: bump failed (see error above)"; return 1; }
   after=$( ( source "$d/PKGBUILD" 2>/dev/null && echo "$pkgver" ) ) \
-    || die "$1: bump left an unreadable PKGBUILD - run: $0 edit $1"
+    || die "$1: bump left an unreadable PKGBUILD"
   if [ "$before" != "$after" ]; then
     cmd_build "$1"
   else
@@ -1954,7 +2111,7 @@ cmd_help() {
   echo "pacgrab - paste a URL, get the app (~/pacgrab)"
   echo
   local cmds=(
-    "<url>|install app from a link (GitHub release or direct download)"
+    "<url>|install or update app from a link (GitHub release or direct download)"
     "list|show managed packages and install status"
     "recipe [p ...]|look inside recipes: one line each, or print full PKGBUILD(s)"
     "build <name ...>|build and install one or more managed packages"
@@ -1963,8 +2120,6 @@ cmd_help() {
     "fix-conflicts|delete unowned files that would block pacgrab package installs"
     "prune [--yes]|delete recipes for apps that are not installed"
     "check|show which GitHub packages have updates"
-    "bump <p> [ver]|bump version: GitHub API or explicit version"
-    "edit <name>|open the PKGBUILD in $EDITOR"
     "new <name> O/R|scaffold a recipe by hand from GitHub owner/repo"
     "clean|delete build leftovers and partial downloads"
     "repo|regenerate the local pacman repo database"
@@ -1974,7 +2129,7 @@ cmd_help() {
   for c in "${cmds[@]}"; do t=${c%%|*}; [ "${#t}" -gt "$w" ] && w=${#t}; done
   for c in "${cmds[@]}"; do printf "  pacgrab %-${w}s  %s\n" "${c%%|*}" "${c#*|}"; done
   echo
-  echo "GitHub links autoupdate. Other links install fine but bump manually."
+  echo "Paste a new URL to install, or paste an updated URL for an existing app to bump + rebuild."
 }
 
 case "${1:-help}" in
@@ -1983,8 +2138,7 @@ case "${1:-help}" in
   recipe|recipes) shift; cmd_recipe "$@" ;;
   build) shift; cmd_build "$@" ;;
   install|add) shift; cmd_add "$@" ;;
-  http*://*) cmd_add "$@" ;; # bare URL -> install
-  bump) shift; cmd_bump "$@" ;;
+  http*://*) cmd_add "$@" ;; # bare URL -> install or bump
   sync) shift; cmd_sync "$@" ;;
   refresh) shift; cmd_refresh "$@" ;;
   fix-conflicts) cmd_fix_conflicts ;;
@@ -1995,7 +2149,6 @@ case "${1:-help}" in
     export PACGRAB_BUILD_ONLY=1
     cmd_self_update; cmd_update_all ;;
   check) cmd_check ;;
-  edit) shift; cmd_edit "$@" ;;
   new) shift; cmd_new "$@" ;;
   clean) cmd_clean ;;
   repo) cmd_repo ;;

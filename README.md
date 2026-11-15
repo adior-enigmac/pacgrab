@@ -84,15 +84,13 @@ exact block to paste.
 ## Usage
 
 ```
-pacgrab <url>             install app from a link (GitHub release or direct download)
+pacgrab <url>             install or update app from a link (GitHub release or direct download)
 pacgrab list              show managed packages and install status
 pacgrab recipe [p ...]    look inside recipes: one line each, or print full PKGBUILD(s)
 pacgrab build <name ...>  build and install one or more managed packages
 pacgrab check             show which GitHub packages have updates
 pacgrab sync [name ...]   install recipe desktops+icons directly, no rebuild
 pacgrab refresh <name>    regenerate recipe from its URL with current code
-pacgrab bump <p> [ver]    bump version: GitHub API or explicit version
-pacgrab edit <name>       open the PKGBUILD in $EDITOR
 pacgrab new <name> O/R    scaffold a recipe by hand from GitHub owner/repo
 pacgrab fix-conflicts     delete unowned files that would block pacgrab package installs
 pacgrab prune [--yes]     delete recipes for apps that are not installed
@@ -179,7 +177,7 @@ Two things worth calling out:
 
 - The repo section **must not** be named `local` — libalpm reserves that name for
   the installed-packages database. `pacgrab` uses `[pacgrab]`.
-- GitHub links autoupdate; other links install fine but you bump them manually.
+- GitHub links autoupdate; other links install fine but you update them by pasting the new URL: `pacgrab <new-url>`.
 
 ## License
 
