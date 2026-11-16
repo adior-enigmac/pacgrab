@@ -833,8 +833,13 @@ cmd_add() {
   if [[ "$url" =~ github\.com/([^/]+/[^/]+)/releases/download/([^/]+)/(.+)$ ]]; then
     gh="${BASH_REMATCH[1]}"; tag="${BASH_REMATCH[2]}"; asset="${BASH_REMATCH[3]}"; aurl="$url"
     ver="${tag#v}"; ver="${ver//-/_}"
-    local atmpl="${asset//$tag/v\$pkgver}"; [[ "$tag" == v* ]] || atmpl="${asset//$tag/\$pkgver}"
-    if [[ "$atmpl" == "$asset" ]]; then atmpl="${asset//$ver/\$pkgver}"; fi
+    # ${pkgver} must be braced: $pkgver_ followed by an identifier char parses
+    # as ONE name ($pkgver_amd64), unset under set -u - openidea's source line
+    # died as "pkgver_amd64: unbound variable". It rides in a variable because
+    # writing the escape inline makes bash close the ${...} at the inner brace.
+    local pver='${pkgver}'
+    local atmpl="${asset//$tag/v$pver}"; [[ "$tag" == v* ]] || atmpl="${asset//$tag/$pver}"
+    if [[ "$atmpl" == "$asset" ]]; then atmpl="${asset//$ver/$pver}"; fi
     if [[ "$tag" == v* ]]; then srcurl="https://github.com/$gh/releases/download/v\$pkgver/$atmpl"
     else srcurl="https://github.com/$gh/releases/download/\$pkgver/$atmpl"; fi
   elif [[ "$url" =~ github\.com/([^/]+/[^/]+?)(/.*)?$ ]]; then
@@ -857,8 +862,13 @@ cmd_add() {
     asset="${aurl##*/}"
     echo "picked: $asset ($tag)"
     ver="${tag#v}"; ver="${ver//-/_}"
-    local atmpl="${asset//$tag/v\$pkgver}"; [[ "$tag" == v* ]] || atmpl="${asset//$tag/\$pkgver}"
-    if [[ "$atmpl" == "$asset" ]]; then atmpl="${asset//$ver/\$pkgver}"; fi
+    # ${pkgver} must be braced: $pkgver_ followed by an identifier char parses
+    # as ONE name ($pkgver_amd64), unset under set -u - openidea's source line
+    # died as "pkgver_amd64: unbound variable". It rides in a variable because
+    # writing the escape inline makes bash close the ${...} at the inner brace.
+    local pver='${pkgver}'
+    local atmpl="${asset//$tag/v$pver}"; [[ "$tag" == v* ]] || atmpl="${asset//$tag/$pver}"
+    if [[ "$atmpl" == "$asset" ]]; then atmpl="${asset//$ver/$pver}"; fi
     if [[ "$tag" == v* ]]; then srcurl="https://github.com/$gh/releases/download/v\$pkgver/$atmpl"
     else srcurl="https://github.com/$gh/releases/download/\$pkgver/$atmpl"; fi
   elif [[ "$url" =~ ^https?:// ]]; then
@@ -1464,7 +1474,8 @@ depends=('hicolor-icon-theme'$(printf " '%s'" "${debdeps[@]}" | sed "s/ ''//"))
 options=('!strip')
 _github="$gh"
 _pacgrab_url="$aurl"
-source=("$asset::$srcurl"$iconsrc)
+_asset="${atmpl:-$asset}"
+source=("\$_asset::$srcurl"$iconsrc)
 sha256sums=('$sum'$iconsum)
 
 package() {
@@ -1472,11 +1483,15 @@ package() {
   # the archive name, so "... data.tar.* -O" parses -O as another *member*, writes
   # 0 bytes, the pipe still exits 0, and makepkg ships an empty package. twindesk
   # 2.2.0-1 installed nothing at all because of that (invisible to rofi/menus).
+  # The filename is \$_asset, never a literal: a bump rewrites source=/_pacgrab_url=
+  # but not package(), so a hardcoded name went stale and the build looked for the
+  # previous release's file - ink-music searched for 2.0.2 while source= already
+  # said 2.1.17. Same \$_asset pattern the tarball branch uses.
   local member
-  member=\$(bsdtar -tf "$asset" | grep -m1 '^data\\.tar' || true)
-  [ -n "\$member" ] || { echo "pacgrab: no data.tar* member in $asset" >&2; return 1; }
-  bsdtar -xOf "$asset" "\$member" | bsdtar -x -C "\$pkgdir"
-  [ -n "\$(ls -A "\$pkgdir" 2>/dev/null)" ] || { echo "pacgrab: $asset unpacked to nothing" >&2; return 1; }
+  member=\$(bsdtar -tf "\$_asset" | grep -m1 '^data\\.tar' || true)
+  [ -n "\$member" ] || { echo "pacgrab: no data.tar* member in \$_asset" >&2; return 1; }
+  bsdtar -xOf "\$_asset" "\$member" | bsdtar -x -C "\$pkgdir"
+  [ -n "\$(ls -A "\$pkgdir" 2>/dev/null)" ] || { echo "pacgrab: \$_asset unpacked to nothing" >&2; return 1; }
   # debs register their desktop entry, /usr/bin launcher and icon from postinst
   # (xdg-desktop-menu, ln -sf), which pacman never runs - the app installs but
   # is invisible to rofi/menus. Replay that here.
@@ -1978,7 +1993,13 @@ cmd_update_all() { # bump+rebuild every _github package that is outdated
     grep -q '^_github=' "$d/PKGBUILD" || continue
     local name; name=$(basename "$d")
     echo "=== $name ==="
-    if cmd_update "$name"; then
+    # Subshell: cmd_update reports trouble with `die`, and die does `exit 1`.
+    # An exit there used to abort the WHOLE run - the first broken recipe or
+    # network blip killed the loop, everything alphabetically after it went
+    # unchecked, and the timer logged failed every night. `exit` only ends the
+    # subshell, so the failure is counted and the loop moves on; the summary
+    # line below is what the run reports.
+    if ( cmd_update "$name" ); then
       n=$((n+1))
     else
       failed+=("$name")
