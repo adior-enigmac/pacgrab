@@ -677,7 +677,7 @@ cmd_repo() {
   # recipe dir (or in PKGDEST), so hardlink them into $BASE and index the
   # link - a hardlink, not a copy, so it costs no disk space. Once linked,
   # find() sees both the link and the original, hence the basename dedupe.
-  local p f
+  local p f d b n
   local -A seen=()
   local -a flat=()
   for p in "${pkgs[@]}"; do
@@ -689,12 +689,62 @@ cmd_repo() {
     fi
     flat+=("$f")
   done
+  # Index only the NEWEST build per package, into a freshly created db.
+  # This used to hand repo-add every historical version in a single -R call:
+  # repo-add prunes in a background subshell, so with byte-ordered input it
+  # unlinked files for versions it was still adding (it deleted sonora 0.50.0-5
+  # while adding 0.50.0-3) and then aborted the whole db write on stale entries
+  # whose file was already gone ("Package database was not modified due to
+  # errors"). -q hid that line and set -e turned the exit code into a silent
+  # failure - `pacgrab repo` returned 1 with no output - so the db froze at its
+  # last good state while the pool files kept moving, until 8 of 20 entries
+  # pointed at packages that no longer existed.
+  local -A best=()
+  local -a names=() newest=()
+  for d in "$BASE"/*/; do
+    d="${d%/}"
+    if [ -f "$d/PKGBUILD" ]; then names+=("${d##*/}"); fi
+  done
+  for p in "${flat[@]}"; do
+    b="${p##*/}"; n=""
+    for d in "${names[@]}"; do
+      case "$b" in "$d"-*) n="$d"; break ;; esac
+    done
+    if [ -z "$n" ]; then
+      newest+=("$p") # pool-only build, no recipe behind it: index as-is
+    elif [ -z "${best[$n]:-}" ] || \
+         [ "$(printf '%s\n%s\n' "${best[$n]##*/}" "$b" | sort -V | tail -1)" = "$b" ]; then
+      best[$n]="$p"
+    fi
+  done
+  for d in "${names[@]}"; do
+    if [ -n "${best[$d]:-}" ]; then newest+=("${best[$d]}"); fi
+  done
   cd "$BASE"
-  repo-add -q -R "$REPO_NAME.db.tar.gz" "${flat[@]}"
+  # Build beside the live db and swap in only on success: a missing
+  # $REPO_NAME.db makes `pacman -Sy` fail for EVERY repo, so the old db has to
+  # survive a failed repo-add instead of being deleted first.
+  local newdb=".new.$REPO_NAME.db.tar.gz" newfiles=""
+  rm -f ".tmp.$newdb"* ".tmp.$REPO_NAME.db.tar.gz"* \
+        ".new.$REPO_NAME"* 2>/dev/null || true
+  rm -f ".tmp.$REPO_NAME.files.tar.gz" 2>/dev/null || true
+  if ! repo-add -q "$newdb" "${newest[@]}"; then
+    rm -f ".tmp.$newdb"* ".new.$REPO_NAME"* 2>/dev/null || true
+    echo "error: repo-add failed - [$REPO_NAME] db left untouched" >&2
+    return 1
+  fi
+  mv -f "$newdb" "$REPO_NAME.db.tar.gz"
+  for newfiles in ".new.$REPO_NAME"*.files.tar.gz; do
+    if [ -f "$newfiles" ]; then mv -f "$newfiles" "$REPO_NAME.files.tar.gz"; break; fi
+  done
+  # repo-add also symlinks <db>.db/<db>.files for the temp name - the targets
+  # are gone after the swap, so these are dangling
+  rm -f ".new.$REPO_NAME"* 2>/dev/null || true
+  rm -f "$REPO_NAME.db.tar.gz.old" "$REPO_NAME.files.tar.gz.old"
   # DownloadUser (default alpm) fetches these over file:// - cover pkgs linked
   # in from recipe dirs, which may have been built under a stricter umask
   chmod o+rX "$BASE"/* 2>/dev/null || true
-  echo "repo updated: ${#flat[@]} package(s). Add to /etc/pacman.conf:"
+  echo "repo updated: ${#newest[@]} package(s) (newest build per package). Add to /etc/pacman.conf:"
   echo "  [$REPO_NAME]"
   echo '  SigLevel = Optional TrustAll'
   echo "  Server = file://$BASE"
@@ -1320,7 +1370,14 @@ cmd_add() {
     fi
     # terminal apps need Terminal=true or launchers (rofi etc.) open nothing.
     # probe the launcher: scripts and GUI-linked ELFs -> false, else true.
-    local terminal="true"
+    # The GUI test has to cover more than the GTK/Qt stacks: sonora is a bare
+    # xcb+xkbcommon ELF (libxcb/libXau/libXdmcp, no libx11, no gtk/qt), which
+    # the narrower list read as terminal-only and gave Terminal=true - every
+    # launcher then opened a terminal window to run a windowed app. Match the
+    # display-server families too: X11/xcb/xkb, Wayland, GL/EGL/Vulkan, SDL.
+    # Deliberately NOT matched: libasound/libpulse/libmpv/libncurses - a CLI
+    # player links those without ever opening a window.
+    local gui_re='lib(gtk|gdk|qt[567]|wx|wayland|glfw|egl|vulkan|drm|gbm|sdl|x11|xcb|xkbcommon|xau|xdmcp|xcursor|xrandr|xinerama|xfixes|xrender|xi[.-]|xdo|gl[.u])'
     if [ -z "$topdesk" ] && [ -z "$desktop" ]; then
       local probe="$tmp/probe-bin" ok=0 member=""
       if [ "$kind" = rawbin ]; then
@@ -1337,7 +1394,7 @@ cmd_add() {
       fi
       if [ "$ok" = 1 ]; then
         if head -c 2 "$probe" 2>/dev/null | grep -q '#!'; then terminal="false"
-        elif ldd "$probe" 2>/dev/null | grep -qiE 'libgtk|libqt[56]|libwx|libx11|libwayland|libglfw|libEGL|libGL\.|libvulkan'; then terminal="false"
+        elif ldd "$probe" 2>/dev/null | grep -qiE "$gui_re"; then terminal="false"
         fi
       fi
       rm -f "$probe"
