@@ -326,7 +326,7 @@ cmd_uninstall() { # uninstall <name> [--purge]: pacman -R it; source dir stays u
 # the recipe is dropped instead of being hashed as-is (stale bytes would be
 # written into sha256sums and rejected by makepkg at build time).
 refresh_sums() {
-  local d="$1" meta fname surl srcdest f want eff
+  local d="$1" meta fname surl srcdest f want eff cached cached_norm
   meta=$(bash -c 'source "$1/PKGBUILD" 2>/dev/null || exit 1
     set -- "${source[@]}"
     [ $# -gt 0 ] || set -- "${source_x86_64[@]}"
@@ -355,11 +355,22 @@ refresh_sums() {
   f="$srcdest/$fname"
   want="$surl"
   # effective URL (redirects) is what cmd_add writes into the sidecar, so
-  # resolve it the same way or every bump would invalidate a valid cache entry
+  # resolve it the same way or every bump would invalidate a valid cache entry.
+  # Only the query-less part is usable: a GitHub release302s to an asset URL
+  # signed fresh on every request (different `jwt`/`sig` each resolve), so the
+  # full effective URL would never equal the stored one and the entry would be
+  # deleted - and re-downloaded - on every single run.
   eff=$(curl -fsSIL --retry 3 --retry-all-errors --retry-delay 2 -o /dev/null \
     -w '%{url_effective}' "$surl" 2>/dev/null || true)
-  if [ -n "$eff" ]; then want="$eff"; fi
-  if [ -f "$f" ] && { [ ! -f "$f.url" ] || [ "$(cat "$f.url")" != "$want" ]; }; then
+  if [ -n "$eff" ]; then want="${eff%%\?*}"; fi
+  # accept either provenance the other half of pacgrab may have written: the
+  # resolved (query-less) URL or the raw recipe/pasted URL, so a run that could
+  # not resolve redirects does not invalidate an entry a resolving run wrote
+  cached=""
+  if [ -f "$f.url" ]; then cached=$(cat "$f.url"); fi
+  cached_norm="${cached%%\?*}"
+  if [ -f "$f" ] && { [ -z "$cached" ] || { [ "$cached_norm" != "${want%%\?*}" ] \
+      && [ "$cached_norm" != "${surl%%\?*}" ]; }; }; then
     echo "cached $fname is from a different URL - re-downloading"
     rm -f "$f" "$f.part" "$f.url"
   fi
@@ -829,7 +840,7 @@ cmd_add() {
   if [ "$force_name" = "--no-build" ]; then force_name=""; nobuild=1; fi
   if [ "${3:-}" = "--no-build" ]; then nobuild=1; fi
 
-  local gh="" tag="" asset aurl ver srcurl
+  local gh="" tag="" asset aurl ver srcurl eff=""
   if [[ "$url" =~ github\.com/([^/]+/[^/]+)/releases/download/([^/]+)/(.+)$ ]]; then
     gh="${BASH_REMATCH[1]}"; tag="${BASH_REMATCH[2]}"; asset="${BASH_REMATCH[3]}"; aurl="$url"
     ver="${tag#v}"; ver="${ver//-/_}"
@@ -890,7 +901,7 @@ cmd_add() {
   local tmp; tmp=$(mktemp -d "${TMPDIR:-/tmp}/pacgrab-add-XXXXXX")
   if [ -z "$gh" ]; then
     # cheap redirect resolution so query-string URLs get their real filename
-    local eff
+    # (eff is declared with the other cmd_add locals above)
     eff=$(curl -fsSIL --retry 3 --retry-all-errors --retry-delay 2 -o /dev/null -w '%{url_effective}' "$aurl" 2>/dev/null || true)
     [ -n "$eff" ] || eff="$aurl"
     local effbase="${eff%%\?*}"; effbase="${effbase##*/}"
@@ -921,8 +932,22 @@ cmd_add() {
   # and that is constant for URLs whose path carries no version (rolling "latest"
   # endpoints, vendor paths with a build id) - without this, refresh skips the
   # download and re-hashes stale bytes into sha256sums, which makepkg then rejects.
-  local want_url="${eff:-$aurl}"
-  if [ -f "$final" ] && { [ ! -f "$final.url" ] || [ "$(cat "$final.url")" != "$want_url" ]; }; then
+  # The GitHub branch above never resolves redirects, so resolve here; then keep
+  # only the query-less part (GitHub re-signs the asset URL on every request, so
+  # the full URL would invalidate the entry on the next run - refresh_sums
+  # compares the same query-less form). Either provenance counts as a hit so an
+  # unresolvable run cannot evict an entry a resolving one wrote.
+  if [ -z "$eff" ]; then
+    eff=$(curl -fsSIL --retry 3 --retry-all-errors --retry-delay 2 -o /dev/null \
+      -w '%{url_effective}' "$aurl" 2>/dev/null || true)
+  fi
+  [ -n "$eff" ] || eff="$aurl"
+  local want_url="${eff%%\?*}"
+  local cached="" cached_norm=""
+  if [ -f "$final.url" ]; then cached=$(cat "$final.url"); fi
+  cached_norm="${cached%%\?*}"
+  if [ -f "$final" ] && { [ -z "$cached" ] || { [ "$cached_norm" != "$want_url" ] \
+      && [ "$cached_norm" != "${aurl%%\?*}" ]; }; }; then
     echo "cached source is from a different URL, re-downloading $asset"
     rm -f "$final" "$final.part" "$final.url"
   fi
