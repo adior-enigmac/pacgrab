@@ -1392,6 +1392,7 @@ cmd_add() {
           if bsdtar -xOf "$tmp/$asset" "$member" > "$probe" 2>/dev/null; then ok=1; fi
         fi
       fi
+      terminal="true"
       if [ "$ok" = 1 ]; then
         if head -c 2 "$probe" 2>/dev/null | grep -q '#!'; then terminal="false"
         elif ldd "$probe" 2>/dev/null | grep -qiE "$gui_re"; then terminal="false"
