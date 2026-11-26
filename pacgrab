@@ -642,7 +642,15 @@ EOF
 PKGDEST_DIR="${PKGDEST:-${XDG_CACHE_HOME:-$HOME/.cache}/makepkg/pkg}"
 
 cmd_clean() {
-  find "$BASE" -maxdepth 2 -name '*.pkg.tar.zst*' -delete
+  # Publish any built artifacts into the POOL first: cmd_repo hardlinks them
+  # into $BASE and indexes them in pacgrab.db. The pool must survive `clean` -
+  # deleting it drops installed packages out of [$REPO_NAME], so pacman no
+  # longer sees a repo providing them and yay falls back to AUR, offering
+  # "upgrades" for packages pacgrab already manages.
+  cmd_repo >/dev/null 2>&1 || true
+  # Delete build leftovers INSIDE recipe dirs only. Never touch the published
+  # pool at $BASE/*.pkg.tar.zst - those files back the db entries above.
+  find "$BASE" -mindepth 2 -maxdepth 2 -name '*.pkg.tar.zst*' -delete
   # the index must not outlive its files: an entry whose package is gone makes
   # `pacman -S` fail with "failed retrieving file", makes `pacman -Syu` abort
   # on it, and makes `pacgrab -S` report "provided by [$REPO_NAME]" as a silent
