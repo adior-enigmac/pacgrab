@@ -2101,12 +2101,23 @@ cmd_update_all() { # bump+rebuild every _github package that is outdated
 }
 
 cmd_self_update() { # fetch latest pacgrab + TUI into $BASE (best-effort: never fails the run)
-  local f tmp
+  local f tmp raw="$PG_RAW"
+  # raw.githubusercontent.com's CDN can keep serving a stale /main for minutes
+  # after a push. Resolve HEAD via the API and fetch by commit sha instead -
+  # sha URLs are immutable, so they are never stale. Fall back to /main offline.
+  local gh_path="${PG_RAW#*raw.githubusercontent.com/}"
+  gh_path="${gh_path%/main}"
+  if [[ "$gh_path" == */* ]]; then
+    local sha
+    sha=$(curl -fsSL --max-time 30 "https://api.github.com/repos/$gh_path/commits/main" 2>/dev/null \
+          | grep -oP '"sha":\s*"\K[0-9a-f]{40}' | head -1)
+    [ -n "$sha" ] && raw="https://raw.githubusercontent.com/$gh_path/$sha"
+  fi
   for f in pacgrab pacgrab-tui.sh; do
     # temp + rename: the running script holds its old inode open, so curl-ing
     # straight over $BASE/pacgrab would corrupt the live run
     tmp=$(mktemp "$BASE/.selfupdate-XXXXXX") || continue
-    if curl -fsSL --max-time 60 "$PG_RAW/$f" -o "$tmp" && [ -s "$tmp" ]; then
+    if curl -fsSL --max-time 60 "$raw/$f" -o "$tmp" && [ -s "$tmp" ]; then
       if cmp -s "$tmp" "$BASE/$f" 2>/dev/null; then
         rm -f "$tmp" # already current - stay quiet in the log
       else
@@ -2236,7 +2247,6 @@ cmd_help() {
     "clean|delete build leftovers and partial downloads"
     "repo|regenerate the local pacman repo database"
     "setup|one-time: create repo db + add [pacgrab] to /etc/pacman.conf"
-    "self-update|update pacgrab + TUI from GitHub"
   )
   local w=0 c t
   for c in "${cmds[@]}"; do t=${c%%|*}; [ "${#t}" -gt "$w" ] && w=${#t}; done
@@ -2266,7 +2276,6 @@ case "${1:-help}" in
   clean) cmd_clean ;;
   repo) cmd_repo ;;
   setup) cmd_setup ;;
-  self-update) cmd_self_update ;;
   timer-setup) cmd_timer_install ;; # internal: what install.sh runs
   *) cmd_help; exit 1;;
 esac
